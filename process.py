@@ -1,6 +1,6 @@
 """
 process.py - Core isometric rendering with OCR-based measurement matching
-Railway API version - generates images from numpy arrays
+Railway API version - EXACT copy of standalone logic
 """
 
 import io, re
@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection, Line3DCollection
 import pytesseract
 
-WALL_H_RATIO, APPROX_EPS = 0.5, 0.01  # Lowered from 0.02 for better corner detection
+WALL_H_RATIO, APPROX_EPS = 0.5, 0.02
 CAM_ELEV, CAM_AZIM = 48, -45
 BG, FLOOR, FLOOR_E = "#dde0e5", "#c8c8c8", "#c8c8c8"
 TONE_R, TONE_L, EDGE_R, EDGE_L = "#909090", "#7a7a7a", "#707070", "#2a2a2a"
@@ -23,7 +23,7 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
     """Takes BGR image, returns PNG bytes of isometric render"""
     h_img, w_img = img_bgr.shape[:2]
 
-    # Detect polygon
+    # Detect polygon - EXACT local logic
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 4)
@@ -35,21 +35,13 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
     cnt_sorted = sorted(contours, key=cv2.contourArea, reverse=True)
     best_cnt = cnt_sorted[0]
     best_pts = None
-    
-    # Try multiple epsilon values to find best polygon approximation
     for cnt in cnt_sorted[:5]:
         if cv2.contourArea(cnt) < h_img * w_img * 0.02: continue
-        
-        # Try decreasing epsilon values until we get a reasonable polygon
-        for eps_factor in [0.01, 0.015, 0.02, 0.025]:
-            eps = eps_factor * cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, eps, True)
-            if 3 <= len(approx) <= 12:
-                best_pts = approx.reshape(-1, 2).astype(float)
-                best_cnt = cnt
-                print(f"DEBUG: Selected polygon with {len(best_pts)} corners using epsilon={eps_factor}")
-                break
-        if best_pts is not None:
+        eps = APPROX_EPS * cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, eps, True)
+        if 3 <= len(approx) <= 12:
+            best_pts = approx.reshape(-1, 2).astype(float)
+            best_cnt = cnt
             break
 
     if best_pts is None:
@@ -64,10 +56,6 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
     area_ratio = area / (bbox_area + 1e-9)
     is_open_shape = area_ratio < OPEN_SHAPE_THRESHOLD
     n = len(best_pts)
-    
-    # DEBUG: Log polygon info
-    print(f"DEBUG: Detected {n} corners, area_ratio={area_ratio:.3f}, is_open={is_open_shape}")
-    print(f"DEBUG: Epsilon used: {APPROX_EPS * cv2.arcLength(best_cnt, True):.2f}px")
 
     # OCR
     try:
@@ -226,20 +214,17 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
         for idx, i in enumerate(visible_edges):
             quad = wall_faces[idx]
             normal = wall_normals[idx]
-            if np.dot(normal, cam_dir) > 0:  # Faces camera = front
+            if np.dot(normal, cam_dir) > 0:
                 front_walls.append((idx, quad))
-            else:  # Faces away = back
+            else:
                 back_walls.append((idx, quad))
         
-        # Render back walls (opaque)
         for idx, quad in back_walls:
             ax.add_collection3d(Poly3DCollection([quad], facecolor=TONE_L, edgecolor=EDGE_L, alpha=1.0, linewidth=0.8))
         
-        # Render front walls (semi-transparent but visible)
         for idx, quad in front_walls:
             ax.add_collection3d(Poly3DCollection([quad], facecolor=TONE_L, edgecolor=EDGE_L, alpha=0.5, linewidth=1.0, zorder=10))
     else:
-        # Open shapes: all walls opaque
         for idx, quad in enumerate(wall_faces):
             ax.add_collection3d(Poly3DCollection([quad], facecolor=TONE_L, edgecolor=EDGE_L, alpha=1.0, linewidth=0.8))
 
