@@ -165,15 +165,9 @@ def generate_isometric(img_bgr):
     pts_m[:, 0] -= pts_m[:, 0].min()
     pts_m[:, 1] -= pts_m[:, 1].min()
 
-    if is_open_shape:
-        # For open shapes, wall height = 50% of average wall length
-        avg_wall_m = np.mean([edge_lens_px[i] * scale_mpx for i in visible_edges])
-        wall_h = avg_wall_m * 0.5
-        span_x = pts_m[:, 0].max()
-        span_y = pts_m[:, 1].max()
-    else:
-        span_x, span_y = pts_m[:, 0].max(), pts_m[:, 1].max()
-        wall_h = WALL_H_RATIO * (span_x + span_y) / 2.0
+    span_x = pts_m[:, 0].max()
+    span_y = pts_m[:, 1].max()
+    wall_h = 2.8 # Fixed height logic: 2.8m for all rooms to show scale
 
     # print(f"📦  Wall height: {wall_h:.2f}m")
 
