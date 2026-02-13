@@ -146,3 +146,85 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
         wall_faces.append([floor_pts[i], floor_pts[j], ceiling_pts[j], ceiling_pts[i]])
         dx, dy = pts_m[j, 0] - pts_m[i, 0], pts_m[j, 1] - pts_m[i, 1]
         nx, ny = dy, -dx
+        mid = (pts_m[i] + pts_m[j]) / 2
+        if nx * (mid[0] - centroid[0]) + ny * (mid[1] - centroid[1]) < 0: nx, ny = -nx, -ny
+        wall_normals.append(np.array([nx, ny, 0]) / np.hypot(nx, ny))
+
+    elev_r, azim_r = np.radians(CAM_ELEV), np.radians(CAM_AZIM)
+    cam_dir = np.array([np.cos(elev_r)*np.cos(azim_r), np.cos(elev_r)*np.sin(azim_r), np.sin(elev_r)])
+    cam_right = np.array([np.sin(azim_r), -np.cos(azim_r), 0])
+
+    faces_cam = lambda n: float(np.dot(n, cam_dir)) > 0
+    shade = lambda n, f: ((TONE_R if np.dot(n[:2], cam_right[:2]) >= 0 else TONE_L),
+                          (EDGE_R if np.dot(n[:2], cam_right[:2]) >= 0 else EDGE_L),
+                          0.28 if f else 1.0)
+
+    back_walls = [(i, q) for i, q in enumerate(wall_faces) if not faces_cam(wall_normals[i])]
+    front_walls = [(i, q) for i, q in enumerate(wall_faces) if faces_cam(wall_normals[i])]
+
+    # Render
+    fig = plt.figure(figsize=(13, 9), facecolor=BG)
+    ax = fig.add_subplot(111, projection="3d")
+    ax.set_facecolor(BG)
+    ax.grid(False)
+    ax.set_axis_off()
+    for pane in [ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane]:
+        pane.fill, pane.set_edgecolor = False, ("none",)
+
+    ax.add_collection3d(Poly3DCollection([floor_pts.tolist()], facecolor=FLOOR, edgecolor=FLOOR_E, alpha=1, linewidth=0.8))
+    grid = [[(x, 0, 0.001), (x, span_y, 0.001)] for x in np.arange(0, span_x+0.5, 0.5)]
+    grid += [[(0, y, 0.001), (span_x, y, 0.001)] for y in np.arange(0, span_y+0.5, 0.5)]
+    ax.add_collection3d(Line3DCollection(grid, colors=FLOOR_E, linewidths=0.4, alpha=0.5))
+
+    shadow = np.column_stack([pts_m[:, 0] + 0.04, pts_m[:, 1] + 0.04, np.full(n, -0.005)])
+    ax.add_collection3d(Poly3DCollection([shadow.tolist()], facecolor="#aaa", edgecolor="none", alpha=0.25))
+
+    for i, q in back_walls:
+        fc, ec, a = shade(wall_normals[i], False)
+        ax.add_collection3d(Poly3DCollection([q], facecolor=fc, edgecolor=ec, alpha=a, linewidth=0.7))
+    for i, q in front_walls:
+        fc, ec, a = shade(wall_normals[i], True)
+        ax.add_collection3d(Poly3DCollection([q], facecolor=fc, edgecolor=ec, alpha=a, linewidth=1, zorder=10))
+
+    # AO
+    for i, q in back_walls + front_walls:
+        p0, p1 = np.array(q[0]), np.array(q[1])
+        c3d = np.array([centroid[0], centroid[1], 0])
+        for step in range(10):
+            t0, t1 = step * 0.055, (step + 1) * 0.055
+            fade = ((1 - step / 10) ** 2) * 0.07
+            def ins(p, t):
+                v = c3d - p; v[2] = 0; v /= (np.linalg.norm(v) + 1e-9)
+                r = p + v * t; r[2] = 0.004; return r
+            s0a, s1a = ins(p0.copy(), t0), ins(p1.copy(), t0)
+            s0b, s1b = ins(p0.copy(), t1), ins(p1.copy(), t1)
+            ax.add_collection3d(Poly3DCollection([[s0a, s1a, s1b, s0b]], facecolor="#111", edgecolor="none", alpha=fade, zorder=4))
+
+    ax.add_collection3d(Line3DCollection([[ceiling_pts[i], ceiling_pts[(i + 1) % n]] for i in range(n)], colors="#555566", linewidths=1.2, alpha=0.9, zorder=11))
+    ax.add_collection3d(Line3DCollection([[floor_pts[i], ceiling_pts[i]] for i in range(n)], colors="#555566", linewidths=1, alpha=0.85, zorder=11))
+
+    # Labels: ABOVE back, BELOW front
+    front_idx = {i for i, _ in front_walls}
+    for i, (_, lbl) in wall_meas.items():
+        mid = (ceiling_pts[i] + ceiling_pts[(i + 1) % n]) / 2
+        is_front = i in front_idx
+        out = wall_normals[i] * (0.55 if is_front else 0.25)
+        z_off = -0.35 if is_front else 0.15
+        ax.text(mid[0] + out[0], mid[1] + out[1], mid[2] + z_off, lbl,
+                fontsize=7.5, fontweight="bold", color="#222", ha="center",
+                va=("top" if is_front else "bottom"),
+                bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="#aaa", alpha=0.95, linewidth=0.6),
+                zorder=50)
+
+    ax.set_xlim(-0.3, span_x + 0.3)
+    ax.set_ylim(-0.3, span_y + 0.3)
+    ax.set_zlim(-0.6, wall_h + 0.3)
+    ax.set_box_aspect([span_x, span_y, wall_h])
+    ax.view_init(elev=CAM_ELEV, azim=CAM_AZIM)
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150, bbox_inches="tight", facecolor=BG)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
