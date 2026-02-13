@@ -192,9 +192,44 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
         grid += [[(0, y, 0.001), (span_x, y, 0.001)] for y in np.arange(0, span_y+0.5, 0.5)]
         ax.add_collection3d(Line3DCollection(grid, colors=FLOOR_E, linewidths=0.4, alpha=0.5))
 
-    # Walls
-    for idx, quad in enumerate(wall_faces):
-        ax.add_collection3d(Poly3DCollection([quad], facecolor=TONE_L, edgecolor=EDGE_L, alpha=1.0, linewidth=0.8))
+    # Calculate camera direction and wall normals
+    elev_r, azim_r = np.radians(CAM_ELEV), np.radians(CAM_AZIM)
+    cam_dir = np.array([np.cos(elev_r)*np.cos(azim_r), np.cos(elev_r)*np.sin(azim_r), np.sin(elev_r)])
+
+    # Calculate wall normals
+    centroid = pts_m.mean(axis=0)
+    wall_normals = []
+    for i in visible_edges:
+        j = (i + 1) % n
+        dx, dy = pts_m[j, 0] - pts_m[i, 0], pts_m[j, 1] - pts_m[i, 1]
+        nx, ny = dy, -dx
+        mid = (pts_m[i] + pts_m[j]) / 2
+        if nx * (mid[0] - centroid[0]) + ny * (mid[1] - centroid[1]) < 0: nx, ny = -nx, -ny
+        wall_normals.append(np.array([nx, ny, 0]) / np.hypot(nx, ny))
+
+    # Separate front and back walls for closed rooms
+    if not is_open_shape:
+        back_walls = []
+        front_walls = []
+        for idx, i in enumerate(visible_edges):
+            quad = wall_faces[idx]
+            normal = wall_normals[idx]
+            if np.dot(normal, cam_dir) > 0:  # Faces camera = front
+                front_walls.append((idx, quad))
+            else:  # Faces away = back
+                back_walls.append((idx, quad))
+        
+        # Render back walls (opaque)
+        for idx, quad in back_walls:
+            ax.add_collection3d(Poly3DCollection([quad], facecolor=TONE_L, edgecolor=EDGE_L, alpha=1.0, linewidth=0.8))
+        
+        # Render front walls (transparent)
+        for idx, quad in front_walls:
+            ax.add_collection3d(Poly3DCollection([quad], facecolor=TONE_L, edgecolor=EDGE_L, alpha=0.28, linewidth=1.0, zorder=10))
+    else:
+        # Open shapes: all walls opaque
+        for idx, quad in enumerate(wall_faces):
+            ax.add_collection3d(Poly3DCollection([quad], facecolor=TONE_L, edgecolor=EDGE_L, alpha=1.0, linewidth=0.8))
 
     # Edges
     for idx, i in enumerate(visible_edges):
