@@ -16,7 +16,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection, Line3DCollection
 import pytesseract
 
 DEFAULT_IMAGE, WALL_H_RATIO, APPROX_EPS = "sketch.jpg", 0.5, 0.02
-CAM_ELEV, CAM_AZIM = 48, -30
+CAM_ELEV, CAM_AZIM = 48, 150
 BG, FLOOR, FLOOR_E = "#dde0e5", "#c8c8c8", "#c8c8c8"
 TONE_R, TONE_L, EDGE_R, EDGE_L = "#909090", "#7a7a7a", "#707070", "#2a2a2a"
 MAX_LABEL_DIST = 150
