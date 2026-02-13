@@ -1,6 +1,5 @@
 """
-process.py - Core isometric rendering with OCR-based measurement matching
-Railway API version - EXACT copy of standalone logic
+process.py - FORCED to match local behavior exactly
 """
 
 import io, re
@@ -12,7 +11,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection, Line3DCollection
 import pytesseract
 
-WALL_H_RATIO, APPROX_EPS = 0.5, 0.02
+WALL_H_RATIO = 0.5
 CAM_ELEV, CAM_AZIM = 48, -45
 BG, FLOOR, FLOOR_E = "#dde0e5", "#c8c8c8", "#c8c8c8"
 TONE_R, TONE_L, EDGE_R, EDGE_L = "#909090", "#7a7a7a", "#707070", "#2a2a2a"
@@ -20,10 +19,9 @@ MAX_LABEL_DIST = 150
 OPEN_SHAPE_THRESHOLD = 0.15
 
 def generate_isometric(img_bgr: np.ndarray) -> bytes:
-    """Takes BGR image, returns PNG bytes of isometric render"""
     h_img, w_img = img_bgr.shape[:2]
 
-    # Detect polygon - EXACT local logic
+    # Detect polygon
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 4)
@@ -36,36 +34,30 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
     best_cnt = cnt_sorted[0]
     best_pts = None
     
-    # Log all attempts for debugging
-    print(f"[DEBUG] Found {len(cnt_sorted)} contours")
-    print(f"[DEBUG] Largest contour area: {cv2.contourArea(cnt_sorted[0]):.0f} px²")
-    print(f"[DEBUG] Image size: {w_img}x{h_img} = {w_img*h_img} px²")
-    print(f"[DEBUG] Min area threshold: {h_img * w_img * 0.02:.0f} px²")
-    
-    for idx, cnt in enumerate(cnt_sorted[:5]):
-        area = cv2.contourArea(cnt)
-        if area < h_img * w_img * 0.02:
-            print(f"[DEBUG] Contour {idx}: area={area:.0f} - SKIPPED (too small)")
-            continue
+    # Try epsilon values from LOW to HIGH to get maximum corner detail
+    for cnt in cnt_sorted[:5]:
+        if cv2.contourArea(cnt) < h_img * w_img * 0.02: continue
         perimeter = cv2.arcLength(cnt, True)
-        eps = APPROX_EPS * perimeter
-        approx = cv2.approxPolyDP(cnt, eps, True)
-        n_corners = len(approx)
-        print(f"[DEBUG] Contour {idx}: area={area:.0f}, perimeter={perimeter:.0f}, eps={eps:.2f}, corners={n_corners}")
-        if 3 <= n_corners <= 12:
-            best_pts = approx.reshape(-1, 2).astype(float)
-            best_cnt = cnt
-            print(f"[DEBUG] ✓ SELECTED: {n_corners} corners")
+        
+        # Start with LOWEST epsilon (most detail) and increase if we get too many corners
+        for eps_multiplier in [0.015, 0.02, 0.025, 0.03]:
+            eps = eps_multiplier * perimeter
+            approx = cv2.approxPolyDP(cnt, eps, True)
+            n_corners = len(approx)
+            
+            if 3 <= n_corners <= 12:
+                best_pts = approx.reshape(-1, 2).astype(float)
+                best_cnt = cnt
+                break
+        
+        if best_pts is not None:
             break
-        else:
-            print(f"[DEBUG] × REJECTED: {n_corners} corners (out of range 3-12)")
 
     if best_pts is None:
         hull = cv2.convexHull(cnt_sorted[0])
-        best_pts = cv2.approxPolyDP(hull, APPROX_EPS * cv2.arcLength(hull, True), True).reshape(-1, 2).astype(float)
+        best_pts = cv2.approxPolyDP(hull, 0.02 * cv2.arcLength(hull, True), True).reshape(-1, 2).astype(float)
         best_cnt = hull
 
-    # Detect open vs closed shape
     area = cv2.contourArea(best_cnt)
     x, y, bw, bh = cv2.boundingRect(best_cnt)
     bbox_area = bw * bh
@@ -96,7 +88,6 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
     except Exception:
         labels = []
 
-    # Match labels to edges
     def perp_dist(px, py, p0, p1):
         x0, y0 = p0; x1, y1 = p1
         dx, dy = x1 - x0, y1 - y0
@@ -130,13 +121,11 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
             wall_meas[i] = (meas_m, f"{meas_m:.2f} m")
             used_labels.add(best_label_idx)
 
-    # Determine visible edges
     if is_open_shape:
         visible_edges = list(wall_meas.keys()) if wall_meas else [0, 1]
     else:
         visible_edges = list(range(n))
 
-    # Scale
     if wall_meas:
         scales = []
         for i, (meas_m, _) in wall_meas.items():
@@ -147,7 +136,6 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
     else:
         scale_mpx = 4.0 / max_edge_px
 
-    # Add computed measurements
     for i in visible_edges:
         if i not in wall_meas:
             computed_m = edge_lens_px[i] * scale_mpx
@@ -157,12 +145,10 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
     pts_m[:, 0] -= pts_m[:, 0].min()
     pts_m[:, 1] -= pts_m[:, 1].min()
 
-    # Fixed wall height
     wall_h = 2.8
     span_x = pts_m[:, 0].max()
     span_y = pts_m[:, 1].max()
 
-    # Geometry
     floor_pts = np.column_stack([pts_m[:, 0], pts_m[:, 1], np.zeros(n)])
     ceiling_pts = np.column_stack([pts_m[:, 0], pts_m[:, 1], np.full(n, wall_h)])
 
@@ -171,7 +157,6 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
         j = (i + 1) % n
         wall_faces.append([floor_pts[i], floor_pts[j], ceiling_pts[j], ceiling_pts[i]])
 
-    # Render
     fig = plt.figure(figsize=(13, 9), facecolor=BG)
     ax = fig.add_subplot(111, projection="3d")
     ax.set_facecolor(BG)
@@ -180,7 +165,6 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
     for pane in [ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane]:
         pane.fill, pane.set_edgecolor = False, ("none",)
 
-    # Ground plane
     if is_open_shape:
         ground_z = -wall_h * 0.6
         floor_width = 0.4
@@ -208,11 +192,9 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
         grid += [[(0, y, 0.001), (span_x, y, 0.001)] for y in np.arange(0, span_y+0.5, 0.5)]
         ax.add_collection3d(Line3DCollection(grid, colors=FLOOR_E, linewidths=0.4, alpha=0.5))
 
-    # Calculate camera direction and wall normals
     elev_r, azim_r = np.radians(CAM_ELEV), np.radians(CAM_AZIM)
     cam_dir = np.array([np.cos(elev_r)*np.cos(azim_r), np.cos(elev_r)*np.sin(azim_r), np.sin(elev_r)])
 
-    # Calculate wall normals
     centroid = pts_m.mean(axis=0)
     wall_normals = []
     for i in visible_edges:
@@ -220,10 +202,9 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
         dx, dy = pts_m[j, 0] - pts_m[i, 0], pts_m[j, 1] - pts_m[i, 1]
         nx, ny = dy, -dx
         mid = (pts_m[i] + pts_m[j]) / 2
-        if nx * (mid[0] - centroid[0]) + ny * (mid[1] - centroid[1]) < 0: nx, ny = -nx, -ny
+        if nx * (mid[0] - centroid[0]) + ny * (midpt[1] - centroid[1]) < 0: nx, ny = -nx, -ny
         wall_normals.append(np.array([nx, ny, 0]) / np.hypot(nx, ny))
 
-    # Separate front and back walls for closed rooms
     if not is_open_shape:
         back_walls = []
         front_walls = []
@@ -244,7 +225,6 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
         for idx, quad in enumerate(wall_faces):
             ax.add_collection3d(Poly3DCollection([quad], facecolor=TONE_L, edgecolor=EDGE_L, alpha=1.0, linewidth=0.8))
 
-    # Edges
     for idx, i in enumerate(visible_edges):
         j = (i + 1) % n
         ax.plot([ceiling_pts[i, 0], ceiling_pts[j, 0]], [ceiling_pts[i, 1], ceiling_pts[j, 1]], 
@@ -252,7 +232,6 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
         ax.plot([floor_pts[i, 0], ceiling_pts[i, 0]], [floor_pts[i, 1], ceiling_pts[i, 1]], 
                 [floor_pts[i, 2], ceiling_pts[i, 2]], color="#555566", linewidth=1.0, alpha=0.85)
 
-    # Labels
     for i, (_, lbl) in wall_meas.items():
         j = (i + 1) % n
         mid = (ceiling_pts[i] + ceiling_pts[j]) / 2
@@ -272,7 +251,6 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
                     color="#222", ha="center", va="bottom", bbox=dict(boxstyle="round,pad=0.25", 
                     facecolor="white", edgecolor="#aaa", alpha=0.95, linewidth=0.6), zorder=50)
 
-    # Camera
     pad = 0.5
     ax.set_xlim(pts_m[:, 0].min() - pad, pts_m[:, 0].max() + pad)
     ax.set_ylim(pts_m[:, 1].min() - pad, pts_m[:, 1].max() + pad)
