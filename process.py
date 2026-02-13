@@ -1,37 +1,27 @@
 """
-process.py - OCR-based isometric room/wall extrusion
-Handles both closed rooms AND open wall segments (L-corners, single walls, etc)
+process.py - Core isometric rendering with OCR-based measurement matching
+Railway API version - generates images from numpy arrays
 """
 
-import sys, os, re
+import io, re
 import cv2
 import numpy as np
-import io
-
-# Set non-interactive backend for matplotlib before importing pyplot
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection, Line3DCollection
 import pytesseract
 
-DEFAULT_IMAGE, WALL_H_RATIO, APPROX_EPS = "sketch.jpg", 0.5, 0.02
-CAM_ELEV, CAM_AZIM = 48, 150
+WALL_H_RATIO, APPROX_EPS = 0.5, 0.02
+CAM_ELEV, CAM_AZIM = 48, -45
 BG, FLOOR, FLOOR_E = "#dde0e5", "#c8c8c8", "#c8c8c8"
 TONE_R, TONE_L, EDGE_R, EDGE_L = "#909090", "#7a7a7a", "#707070", "#2a2a2a"
 MAX_LABEL_DIST = 150
-OPEN_SHAPE_THRESHOLD = 0.15  # area/bbox < 15% = open shape
+OPEN_SHAPE_THRESHOLD = 0.15
 
-def generate_isometric(img_bgr):
-    """
-    Takes an OpenCV BGR image array, processes it to generate an isometric 3D view,
-    and returns the PNG image as bytes.
-    """
-    if img_bgr is None:
-        raise ValueError("Image data is None")
-
+def generate_isometric(img_bgr: np.ndarray) -> bytes:
+    """Takes BGR image, returns PNG bytes of isometric render"""
     h_img, w_img = img_bgr.shape[:2]
-    # print(f"📷  Processing image: {w_img}x{h_img}")
 
     # Detect polygon
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -40,9 +30,7 @@ def generate_isometric(img_bgr):
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     dilated = cv2.dilate(thresh, kernel, iterations=2)
     contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if not contours:
-        raise ValueError("No contours found in image")
+    if not contours: raise ValueError("No contours found")
 
     cnt_sorted = sorted(contours, key=cv2.contourArea, reverse=True)
     best_cnt = cnt_sorted[0]
@@ -61,39 +49,36 @@ def generate_isometric(img_bgr):
         best_pts = cv2.approxPolyDP(hull, APPROX_EPS * cv2.arcLength(hull, True), True).reshape(-1, 2).astype(float)
         best_cnt = hull
 
-    # Detect if this is an OPEN shape (just walls) or CLOSED room
+    # Detect open vs closed shape
     area = cv2.contourArea(best_cnt)
     x, y, bw, bh = cv2.boundingRect(best_cnt)
     bbox_area = bw * bh
     area_ratio = area / (bbox_area + 1e-9)
     is_open_shape = area_ratio < OPEN_SHAPE_THRESHOLD
-
     n = len(best_pts)
-    # print(f"✅  {n}-corner polygon, area_ratio={area_ratio:.3f} → {'OPEN WALLS' if is_open_shape else 'CLOSED ROOM'}")
 
     # OCR
-    big = cv2.resize(img_bgr, (w_img*3, h_img*3), interpolation=cv2.INTER_CUBIC)
-    data = pytesseract.image_to_data(big, config="--psm 11", output_type=pytesseract.Output.DICT)
-    tokens = [(t.strip(), (data["left"][i] + data["width"][i]//2)//3, (data["top"][i] + data["height"][i]//2)//3)
-              for i, t in enumerate(data["text"]) if t.strip()]
+    try:
+        big = cv2.resize(img_bgr, (w_img*3, h_img*3), interpolation=cv2.INTER_CUBIC)
+        data = pytesseract.image_to_data(big, config="--psm 11", output_type=pytesseract.Output.DICT)
+        tokens = [(t.strip(), (data["left"][i] + data["width"][i]//2)//3, (data["top"][i] + data["height"][i]//2)//3)
+                  for i, t in enumerate(data["text"]) if t.strip()]
 
-    labels, skip = [], set()
-    for i, (t, cx, cy) in enumerate(tokens):
-        if i in skip: continue
-        # Match "X.XX m" or "X.XX M"
-        m = re.match(r"(\d+[.,]\d+)\s*[mM]$", t)
-        if m:
-            labels.append((float(m.group(1).replace(",", ".")), cx, cy))
-        elif re.match(r"\d+[.,]\d+$", t) and i+1 < len(tokens):
-            nt, nx, ny = tokens[i+1]
-            if re.match(r"[mM]$", nt) and abs(nx - cx) < 80:
-                labels.append((float(t.replace(",", ".")), (cx+nx)//2, (cy+ny)//2))
-                skip.add(i+1)
-            # Also allow standalone decimal numbers (assume metres) if not followed by °
-            elif not re.match(r"[°]", nt):
-                labels.append((float(t.replace(",", ".")), cx, cy))
-
-    # print(f"📏  OCR: {[f'{m:.2f}m' for m,_,_ in labels]}")
+        labels, skip = [], set()
+        for i, (t, cx, cy) in enumerate(tokens):
+            if i in skip: continue
+            m = re.match(r"(\d+[.,]\d+)\s*[mM]$", t)
+            if m:
+                labels.append((float(m.group(1).replace(",", ".")), cx, cy))
+            elif re.match(r"\d+[.,]\d+$", t) and i+1 < len(tokens):
+                nt, nx, ny = tokens[i+1]
+                if re.match(r"[mM]$", nt) and abs(nx - cx) < 80:
+                    labels.append((float(t.replace(",", ".")), (cx+nx)//2, (cy+ny)//2))
+                    skip.add(i+1)
+                elif not re.match(r"[°]", nt):
+                    labels.append((float(t.replace(",", ".")), cx, cy))
+    except Exception:
+        labels = []
 
     # Match labels to edges
     def perp_dist(px, py, p0, p1):
@@ -126,20 +111,12 @@ def generate_isometric(img_bgr):
                 meas_str = f"{meas_m:.2f}"
                 if meas_str[0] == '7':
                     meas_m = float('1' + meas_str[1:])
-                    # print(f"   🔧 OCR fix: 7.XX → 1.XX")
             wall_meas[i] = (meas_m, f"{meas_m:.2f} m")
             used_labels.add(best_label_idx)
-            # print(f"   Edge {i} ({edge_px:.0f}px) → {meas_m:.2f} m")
 
-    # For OPEN shapes, visible edges = ONLY edges with OCR labels
+    # Determine visible edges
     if is_open_shape:
-        if wall_meas:
-            visible_edges = list(wall_meas.keys())
-            # print(f"   Open shape: walls with measurements = {visible_edges}")
-        else:
-            # Fallback: use vertical + horizontal edges (first 2)
-            visible_edges = [0, 1]
-            # print(f"   Open shape: using first 2 edges = {visible_edges}")
+        visible_edges = list(wall_meas.keys()) if wall_meas else [0, 1]
     else:
         visible_edges = list(range(n))
 
@@ -159,19 +136,17 @@ def generate_isometric(img_bgr):
         if i not in wall_meas:
             computed_m = edge_lens_px[i] * scale_mpx
             wall_meas[i] = (computed_m, f"{computed_m:.2f} m")
-            # print(f"   Edge {i} ({edge_lens_px[i]:.0f}px) → {computed_m:.2f} m (computed)")
 
     pts_m = best_pts * scale_mpx
     pts_m[:, 0] -= pts_m[:, 0].min()
     pts_m[:, 1] -= pts_m[:, 1].min()
 
+    # Fixed wall height
+    wall_h = 2.8
     span_x = pts_m[:, 0].max()
     span_y = pts_m[:, 1].max()
-    wall_h = 2.8 # Fixed height logic: 2.8m for all rooms to show scale
 
-    # print(f"📦  Wall height: {wall_h:.2f}m")
-
-    # Geometry - ONLY for visible edges
+    # Geometry
     floor_pts = np.column_stack([pts_m[:, 0], pts_m[:, 1], np.zeros(n)])
     ceiling_pts = np.column_stack([pts_m[:, 0], pts_m[:, 1], np.full(n, wall_h)])
 
@@ -189,73 +164,55 @@ def generate_isometric(img_bgr):
     for pane in [ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane]:
         pane.fill, pane.set_edgecolor = False, ("none",)
 
-    # Ground plane - only under visible walls for open shapes
+    # Ground plane
     if is_open_shape:
-        ground_z = -wall_h * 0.6  # Floor much lower (60% of wall height below)
-        floor_width = 0.4  # Width of floor strip under each wall
-        
-        # Create floor strip under each visible wall
+        ground_z = -wall_h * 0.6
+        floor_width = 0.4
         for i in visible_edges:
             j = (i + 1) % n
             p0, p1 = floor_pts[i].copy(), floor_pts[j].copy()
-            
-            # Calculate inward normal (toward interior)
             dx, dy = p1[0] - p0[0], p1[1] - p0[1]
-            nx, ny = -dy, dx  # Perpendicular
+            nx, ny = -dy, dx
             length = np.hypot(nx, ny)
             nx, ny = nx / length, ny / length
-            
-            # Create floor strip extending inward from wall
             f0 = np.array([p0[0], p0[1], ground_z])
             f1 = np.array([p1[0], p1[1], ground_z])
             f2 = np.array([p1[0] + nx * floor_width, p1[1] + ny * floor_width, ground_z])
             f3 = np.array([p0[0] + nx * floor_width, p0[1] + ny * floor_width, ground_z])
-            
             ax.add_collection3d(Poly3DCollection([[f0, f1, f2, f3]], 
                 facecolor=FLOOR, edgecolor=FLOOR_E, alpha=0.7, linewidth=0.5))
-            
-            # Grid lines on floor strip
             for t in np.linspace(0, 1, 11):
                 gp0 = f0 + t * (f1 - f0)
                 gp1 = f3 + t * (f2 - f3)
                 ax.plot([gp0[0], gp1[0]], [gp0[1], gp1[1]], [gp0[2], gp1[2]], 
                         color=FLOOR_E, linewidth=0.3, alpha=0.6)
     else:
-        # Closed room: full floor
         ax.add_collection3d(Poly3DCollection([floor_pts.tolist()], facecolor=FLOOR, edgecolor=FLOOR_E, alpha=1, linewidth=0.8))
         grid = [[(x, 0, 0.001), (x, span_y, 0.001)] for x in np.arange(0, span_x+0.5, 0.5)]
         grid += [[(0, y, 0.001), (span_x, y, 0.001)] for y in np.arange(0, span_y+0.5, 0.5)]
         ax.add_collection3d(Line3DCollection(grid, colors=FLOOR_E, linewidths=0.4, alpha=0.5))
 
-    # Walls - all opaque for open shapes
+    # Walls
     for idx, quad in enumerate(wall_faces):
         ax.add_collection3d(Poly3DCollection([quad], facecolor=TONE_L, edgecolor=EDGE_L, alpha=1.0, linewidth=0.8))
 
     # Edges
     for idx, i in enumerate(visible_edges):
         j = (i + 1) % n
-        ax.plot([ceiling_pts[i, 0], ceiling_pts[j, 0]], 
-                [ceiling_pts[i, 1], ceiling_pts[j, 1]], 
-                [ceiling_pts[i, 2], ceiling_pts[j, 2]], 
-                color="#555566", linewidth=1.2, alpha=0.9)
-        ax.plot([floor_pts[i, 0], ceiling_pts[i, 0]], 
-                [floor_pts[i, 1], ceiling_pts[i, 1]], 
-                [floor_pts[i, 2], ceiling_pts[i, 2]], 
-                color="#555566", linewidth=1.0, alpha=0.85)
+        ax.plot([ceiling_pts[i, 0], ceiling_pts[j, 0]], [ceiling_pts[i, 1], ceiling_pts[j, 1]], 
+                [ceiling_pts[i, 2], ceiling_pts[j, 2]], color="#555566", linewidth=1.2, alpha=0.9)
+        ax.plot([floor_pts[i, 0], ceiling_pts[i, 0]], [floor_pts[i, 1], ceiling_pts[i, 1]], 
+                [floor_pts[i, 2], ceiling_pts[i, 2]], color="#555566", linewidth=1.0, alpha=0.85)
 
     # Labels
     for i, (_, lbl) in wall_meas.items():
         j = (i + 1) % n
         mid = (ceiling_pts[i] + ceiling_pts[j]) / 2
-        # For open shapes, place labels outside
         if is_open_shape:
-            # Simple offset upward
-            ax.text(mid[0], mid[1], mid[2] + 0.3, lbl,
-                    fontsize=7.5, fontweight="bold", color="#222", ha="center", va="bottom",
-                    bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="#aaa", alpha=0.95, linewidth=0.6),
-                    zorder=50)
+            ax.text(mid[0], mid[1], mid[2] + 0.3, lbl, fontsize=7.5, fontweight="bold", color="#222", 
+                    ha="center", va="bottom", bbox=dict(boxstyle="round,pad=0.25", facecolor="white", 
+                    edgecolor="#aaa", alpha=0.95, linewidth=0.6), zorder=50)
         else:
-            # Closed room: same as before
             centroid = pts_m.mean(axis=0)
             dx, dy = pts_m[j, 0] - pts_m[i, 0], pts_m[j, 1] - pts_m[i, 1]
             nx, ny = dy, -dx
@@ -263,45 +220,26 @@ def generate_isometric(img_bgr):
             if nx * (midpt[0] - centroid[0]) + ny * (midpt[1] - centroid[1]) < 0: nx, ny = -nx, -ny
             normal = np.array([nx, ny, 0]) / np.hypot(nx, ny)
             out = normal * 0.25
-            ax.text(mid[0] + out[0], mid[1] + out[1], mid[2] + 0.15, lbl,
-                    fontsize=7.5, fontweight="bold", color="#222", ha="center", va="bottom",
-                    bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="#aaa", alpha=0.95, linewidth=0.6),
-                    zorder=50)
+            ax.text(mid[0] + out[0], mid[1] + out[1], mid[2] + 0.15, lbl, fontsize=7.5, fontweight="bold", 
+                    color="#222", ha="center", va="bottom", bbox=dict(boxstyle="round,pad=0.25", 
+                    facecolor="white", edgecolor="#aaa", alpha=0.95, linewidth=0.6), zorder=50)
 
     # Camera
     pad = 0.5
     ax.set_xlim(pts_m[:, 0].min() - pad, pts_m[:, 0].max() + pad)
     ax.set_ylim(pts_m[:, 1].min() - pad, pts_m[:, 1].max() + pad)
     if is_open_shape:
-        ax.set_zlim(-wall_h * 0.7, wall_h + pad)  # Show floor at -60% of wall height
+        ax.set_zlim(-wall_h * 0.7, wall_h + pad)
     else:
         ax.set_zlim(-0.3, wall_h + pad)
     ax.set_box_aspect([span_x if not is_open_shape else pts_m[:, 0].max() - pts_m[:, 0].min(), 
                         span_y if not is_open_shape else pts_m[:, 1].max() - pts_m[:, 1].min(), 
-                        wall_h * 1.5 if is_open_shape else wall_h])  # Taller aspect for open shapes
+                        wall_h * 1.5 if is_open_shape else wall_h])
     ax.view_init(elev=CAM_ELEV, azim=CAM_AZIM)
-    
+
     plt.tight_layout()
-    
-    # Save to BytesIO
     buf = io.BytesIO()
     plt.savefig(buf, format="png", dpi=150, bbox_inches="tight", facecolor=BG)
     plt.close(fig)
     buf.seek(0)
-    return buf.getvalue()
-
-if __name__ == "__main__":
-    image_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_IMAGE
-    if not os.path.exists(image_path):
-        print(f"❌  {image_path} not found")
-        sys.exit(1)
-        
-    img_bgr = cv2.imread(image_path)
-    try:
-        png_bytes = generate_isometric(img_bgr)
-        with open("isometric_output.png", "wb") as f:
-            f.write(png_bytes)
-        print("💾  isometric_output.png saved")
-    except Exception as e:
-        print(f"❌  Error: {e}")
-        sys.exit(1)
+    return buf.read()
