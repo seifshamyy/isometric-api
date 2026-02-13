@@ -1,6 +1,5 @@
 FROM python:3.11-slim
 
-# Install Tesseract + OpenCV system deps
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     libgl1 \
@@ -22,7 +21,9 @@ EXPOSE 5000
 CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:5000", "--timeout", "120", "--workers", "2"]
 ```
 
-## 4. `requirements.txt`
+---
+
+**requirements.txt**
 ```
 flask==3.0.3
 gunicorn==22.0.0
