@@ -1,5 +1,5 @@
 """
-process.py - FORCED to match local behavior exactly
+process.py - BULLETPROOF polygon detection with validation
 """
 
 import io, re
@@ -18,6 +18,43 @@ TONE_R, TONE_L, EDGE_R, EDGE_L = "#909090", "#7a7a7a", "#707070", "#2a2a2a"
 MAX_LABEL_DIST = 150
 OPEN_SHAPE_THRESHOLD = 0.15
 
+def validate_polygon(pts):
+    """Returns True if polygon has no micro-edges"""
+    n = len(pts)
+    if n < 3 or n > 12:
+        return False
+    
+    # Calculate perimeter
+    perimeter = sum([np.hypot(pts[(i+1)%n,0] - pts[i,0], pts[(i+1)%n,1] - pts[i,1]) for i in range(n)])
+    
+    # Check each edge - reject if any edge is < 3% of total perimeter
+    min_edge_length = perimeter * 0.03
+    for i in range(n):
+        j = (i + 1) % n
+        edge_len = np.hypot(pts[j,0] - pts[i,0], pts[j,1] - pts[i,1])
+        if edge_len < min_edge_length:
+            return False
+    
+    return True
+
+def detect_polygon_robust(contour, attempts=10):
+    """Try multiple epsilon values and return first VALID polygon"""
+    perimeter = cv2.arcLength(contour, True)
+    
+    # Try epsilon from 0.01 to 0.04 in small steps
+    for eps_mult in np.linspace(0.01, 0.04, attempts):
+        eps = eps_mult * perimeter
+        approx = cv2.approxPolyDP(contour, eps, True)
+        pts = approx.reshape(-1, 2).astype(float)
+        
+        if validate_polygon(pts):
+            return pts
+    
+    # Fallback: use convex hull with medium epsilon
+    hull = cv2.convexHull(contour)
+    approx = cv2.approxPolyDP(hull, 0.02 * cv2.arcLength(hull, True), True)
+    return approx.reshape(-1, 2).astype(float)
+
 def generate_isometric(img_bgr: np.ndarray) -> bytes:
     h_img, w_img = img_bgr.shape[:2]
 
@@ -28,42 +65,23 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     dilated = cv2.dilate(thresh, kernel, iterations=2)
     contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours: raise ValueError("No contours found")
+    if not contours:
+        raise ValueError("No contours found")
 
+    # Find largest contour
     cnt_sorted = sorted(contours, key=cv2.contourArea, reverse=True)
     best_cnt = cnt_sorted[0]
-    best_pts = None
     
-    # Try epsilon values from LOW to HIGH to get maximum corner detail
-    for cnt in cnt_sorted[:5]:
-        if cv2.contourArea(cnt) < h_img * w_img * 0.02: continue
-        perimeter = cv2.arcLength(cnt, True)
-        
-        # Start with LOWEST epsilon (most detail) and increase if we get too many corners
-        for eps_multiplier in [0.015, 0.02, 0.025, 0.03]:
-            eps = eps_multiplier * perimeter
-            approx = cv2.approxPolyDP(cnt, eps, True)
-            n_corners = len(approx)
-            
-            if 3 <= n_corners <= 12:
-                best_pts = approx.reshape(-1, 2).astype(float)
-                best_cnt = cnt
-                break
-        
-        if best_pts is not None:
-            break
+    # Use robust detection
+    best_pts = detect_polygon_robust(best_cnt)
+    n = len(best_pts)
 
-    if best_pts is None:
-        hull = cv2.convexHull(cnt_sorted[0])
-        best_pts = cv2.approxPolyDP(hull, 0.02 * cv2.arcLength(hull, True), True).reshape(-1, 2).astype(float)
-        best_cnt = hull
-
+    # Detect open vs closed shape
     area = cv2.contourArea(best_cnt)
     x, y, bw, bh = cv2.boundingRect(best_cnt)
     bbox_area = bw * bh
     area_ratio = area / (bbox_area + 1e-9)
     is_open_shape = area_ratio < OPEN_SHAPE_THRESHOLD
-    n = len(best_pts)
 
     # OCR
     try:
@@ -74,7 +92,8 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
 
         labels, skip = [], set()
         for i, (t, cx, cy) in enumerate(tokens):
-            if i in skip: continue
+            if i in skip:
+                continue
             m = re.match(r"(\d+[.,]\d+)\s*[mM]$", t)
             if m:
                 labels.append((float(m.group(1).replace(",", ".")), cx, cy))
@@ -89,9 +108,11 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
         labels = []
 
     def perp_dist(px, py, p0, p1):
-        x0, y0 = p0; x1, y1 = p1
+        x0, y0 = p0
+        x1, y1 = p1
         dx, dy = x1 - x0, y1 - y0
-        if dx == 0 and dy == 0: return np.hypot(px - x0, py - y0)
+        if dx == 0 and dy == 0:
+            return np.hypot(px - x0, py - y0)
         t = max(0, min(1, ((px - x0) * dx + (py - y0) * dy) / (dx*dx + dy*dy)))
         proj_x, proj_y = x0 + t * dx, y0 + t * dy
         return np.hypot(px - proj_x, py - proj_y)
@@ -108,7 +129,8 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
         edge_px = edge_lens_px[i]
         best_d, best_label_idx = 1e9, -1
         for label_idx, (meas_m, lx, ly) in enumerate(labels):
-            if label_idx in used_labels: continue
+            if label_idx in used_labels:
+                continue
             dist = perp_dist(lx, ly, p0, p1)
             if dist < MAX_LABEL_DIST and dist < best_d:
                 best_d, best_label_idx = dist, label_idx
@@ -131,8 +153,9 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
         for i, (meas_m, _) in wall_meas.items():
             j = (i + 1) % n
             px_len = np.hypot(best_pts[j, 0] - best_pts[i, 0], best_pts[j, 1] - best_pts[i, 1])
-            scales.append(meas_m / px_len)
-        scale_mpx = np.median(scales)
+            if px_len > 0:
+                scales.append(meas_m / px_len)
+        scale_mpx = np.median(scales) if scales else 4.0 / max_edge_px
     else:
         scale_mpx = 4.0 / max_edge_px
 
@@ -163,7 +186,8 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
     ax.grid(False)
     ax.set_axis_off()
     for pane in [ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane]:
-        pane.fill, pane.set_edgecolor = False, ("none",)
+        pane.fill = False
+        pane.set_edgecolor("none")
 
     if is_open_shape:
         ground_z = -wall_h * 0.6
@@ -174,7 +198,8 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
             dx, dy = p1[0] - p0[0], p1[1] - p0[1]
             nx, ny = -dy, dx
             length = np.hypot(nx, ny)
-            nx, ny = nx / length, ny / length
+            if length > 0:
+                nx, ny = nx / length, ny / length
             f0 = np.array([p0[0], p0[1], ground_z])
             f1 = np.array([p1[0], p1[1], ground_z])
             f2 = np.array([p1[0] + nx * floor_width, p1[1] + ny * floor_width, ground_z])
@@ -202,8 +227,13 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
         dx, dy = pts_m[j, 0] - pts_m[i, 0], pts_m[j, 1] - pts_m[i, 1]
         nx, ny = dy, -dx
         mid = (pts_m[i] + pts_m[j]) / 2
-        if nx * (mid[0] - centroid[0]) + ny * (midpt[1] - centroid[1]) < 0: nx, ny = -nx, -ny
-        wall_normals.append(np.array([nx, ny, 0]) / np.hypot(nx, ny))
+        if nx * (mid[0] - centroid[0]) + ny * (mid[1] - centroid[1]) < 0:
+            nx, ny = -nx, -ny
+        length = np.hypot(nx, ny)
+        if length > 0:
+            wall_normals.append(np.array([nx, ny, 0]) / length)
+        else:
+            wall_normals.append(np.array([0, 0, 0]))
 
     if not is_open_shape:
         back_walls = []
@@ -240,16 +270,18 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
                     ha="center", va="bottom", bbox=dict(boxstyle="round,pad=0.25", facecolor="white", 
                     edgecolor="#aaa", alpha=0.95, linewidth=0.6), zorder=50)
         else:
-            centroid = pts_m.mean(axis=0)
             dx, dy = pts_m[j, 0] - pts_m[i, 0], pts_m[j, 1] - pts_m[i, 1]
             nx, ny = dy, -dx
             midpt = (pts_m[i] + pts_m[j]) / 2
-            if nx * (midpt[0] - centroid[0]) + ny * (midpt[1] - centroid[1]) < 0: nx, ny = -nx, -ny
-            normal = np.array([nx, ny, 0]) / np.hypot(nx, ny)
-            out = normal * 0.25
-            ax.text(mid[0] + out[0], mid[1] + out[1], mid[2] + 0.15, lbl, fontsize=7.5, fontweight="bold", 
-                    color="#222", ha="center", va="bottom", bbox=dict(boxstyle="round,pad=0.25", 
-                    facecolor="white", edgecolor="#aaa", alpha=0.95, linewidth=0.6), zorder=50)
+            if nx * (midpt[0] - centroid[0]) + ny * (midpt[1] - centroid[1]) < 0:
+                nx, ny = -nx, -ny
+            length = np.hypot(nx, ny)
+            if length > 0:
+                normal = np.array([nx, ny, 0]) / length
+                out = normal * 0.25
+                ax.text(mid[0] + out[0], mid[1] + out[1], mid[2] + 0.15, lbl, fontsize=7.5, fontweight="bold", 
+                        color="#222", ha="center", va="bottom", bbox=dict(boxstyle="round,pad=0.25", 
+                        facecolor="white", edgecolor="#aaa", alpha=0.95, linewidth=0.6), zorder=50)
 
     pad = 0.5
     ax.set_xlim(pts_m[:, 0].min() - pad, pts_m[:, 0].max() + pad)
