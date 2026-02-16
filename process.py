@@ -69,7 +69,7 @@ COLOR_TO_FIXTURE = {
     "pink":    "sink",
     "magenta": "fridge",
     "yellow":  "window",
-    "red":     "oven",
+    "red":     "stove",
     "blue":    "door",
 }
 
@@ -381,12 +381,12 @@ def _render_fixtures(ax, fixtures, floor_3d, ceiling_3d, pts_m, scale, cam_dir):
                                 face_clr=FRIDGE_CLR, edge_clr=FRIDGE_EDGE,
                                 label="Fridge", dot=dot)
 
-        elif ftype == "oven":
+        elif ftype == "stove":
             _render_box_fixture(ax, p_start_floor, p_end_floor, inward_3d,
                                 floor_z=0.0, bottom_z=0.0,
                                 top_z=OVEN_H, depth=OVEN_DEPTH,
                                 face_clr=OVEN_CLR, edge_clr=OVEN_EDGE,
-                                label="Oven", dot=dot)
+                                label="Stove", dot=dot)
 
         elif ftype == "window":
             _render_window(ax, p_start_floor, p_end_floor, outward_3d,
