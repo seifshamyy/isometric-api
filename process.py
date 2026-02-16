@@ -406,7 +406,19 @@ def _render_opening(ax, p_start, p_end, wall_h):
 def _render_box_fixture(ax, p_start, p_end, inward_3d,
                          floor_z, bottom_z, top_z, depth,
                          face_clr, edge_clr, label, dot):
-    """Render a box (sink, fridge, oven) against the wall."""
+    """Render a solid colored box (sink, fridge, stove) against the wall."""
+    # Ensure floor-level items sit exactly on the floor
+    p_start = p_start.copy()
+    p_end = p_end.copy()
+    p_start[2] = 0.0
+    p_end[2] = 0.0
+
+    # Edge direction along the wall
+    edge_dir = p_end[:2] - p_start[:2]
+    edge_len = np.linalg.norm(edge_dir)
+    if edge_len < 1e-6:
+        return
+
     # Four base corners at bottom_z
     c0 = p_start.copy(); c0[2] = bottom_z
     c1 = p_end.copy();   c1[2] = bottom_z
@@ -425,27 +437,15 @@ def _render_box_fixture(ax, p_start, p_end, inward_3d,
         [c0, c3, c7, c4],  # left face
         [c1, c2, c6, c5],  # right face
         [c4, c5, c6, c7],  # top face
+        [c0, c1, c2, c3],  # bottom face
     ]
-    if bottom_z > 0.01:
-        faces.append([c0, c1, c2, c3])  # bottom face (visible if raised)
 
-    alpha = 0.92 if dot > 0 else 1.0
+    alpha = 0.88 if dot > 0 else 0.95
     for face in faces:
         ax.add_collection3d(Poly3DCollection(
             [face], facecolor=face_clr, edgecolor=edge_clr,
-            alpha=alpha, linewidth=0.8, zorder=20
+            alpha=alpha, linewidth=0.9, zorder=20
         ))
-
-    # Draw wireframe edges explicitly for visibility against z-fighting
-    all_corners = [c0, c1, c2, c3, c4, c5, c6, c7]
-    edges_wire = [
-        (c0, c1), (c1, c2), (c2, c3), (c3, c0),  # bottom
-        (c4, c5), (c5, c6), (c6, c7), (c7, c4),  # top
-        (c0, c4), (c1, c5), (c2, c6), (c3, c7),  # verticals
-    ]
-    for a, b in edges_wire:
-        ax.plot([a[0], b[0]], [a[1], b[1]], [a[2], b[2]],
-                color=edge_clr, linewidth=1.0, alpha=0.9, zorder=25)
 
     # Label on top
     center_top = (c4 + c5 + c6 + c7) / 4.0
@@ -503,6 +503,19 @@ def _render_window(ax, p_start, p_end, outward_3d, label, dot):
 
 def _render_door(ax, p_start, p_end, inward_3d, label, dot):
     """Render a door as a cutout with a thin frame and arc suggestion."""
+    # Enforce minimum door width of 0.70m
+    MIN_DOOR_W = 0.70
+    door_vec = p_end - p_start
+    door_width = np.linalg.norm(door_vec[:2])
+    if door_width < MIN_DOOR_W and door_width > 0.01:
+        # Expand symmetrically from center
+        center = (p_start + p_end) / 2.0
+        door_dir = door_vec / (np.linalg.norm(door_vec) + 1e-12)
+        p_start = center - door_dir * (MIN_DOOR_W / 2.0)
+        p_end   = center + door_dir * (MIN_DOOR_W / 2.0)
+        p_start[2] = 0.0
+        p_end[2] = 0.0
+        door_width = MIN_DOOR_W
     # Door frame
     c0 = p_start.copy(); c0[2] = 0.0
     c1 = p_end.copy();   c1[2] = 0.0
@@ -565,18 +578,22 @@ def _get_wall_segments(edge_idx, fixtures, n_pts):
     """
     # Collect gap ranges for this edge
     gaps = []
+    gap_fixtures = {}  # track which fixture made which gap
     for fix in fixtures:
         if fix["edge_idx"] != edge_idx:
             continue
         ftype = fix["fixture_type"]
         if ftype == "opening":
             gaps.append((fix["t_start"], fix["t_end"]))
+            gap_fixtures[(fix["t_start"], fix["t_end"])] = fix
         elif ftype == "door":
             gaps.append((fix["t_start"], fix["t_end"]))
-        elif ftype == "window":
-            # Window doesn't fully remove wall, just the middle part
-            # We'll render the wall with a hole for the window
+            gap_fixtures[(fix["t_start"], fix["t_end"])] = fix
+        elif ftype in ("sink", "stove", "fridge"):
+            # Cut the wall behind box fixtures so they're visible
             gaps.append((fix["t_start"], fix["t_end"]))
+            gap_fixtures[(fix["t_start"], fix["t_end"])] = fix
+        # Window does NOT create a wall gap — full wall stays, glass overlays
 
     if not gaps:
         return [(0.0, 1.0, True, None)]
@@ -599,9 +616,11 @@ def _get_wall_segments(edge_idx, fixtures, n_pts):
         # Find what fixture created this gap
         gap_fixture = None
         for fix in fixtures:
-            if fix["edge_idx"] == edge_idx and abs(fix["t_start"] - g_start) < 0.01:
-                gap_fixture = fix
-                break
+            if fix["edge_idx"] == edge_idx:
+                # Check if this fixture overlaps with the gap
+                if fix["t_start"] < g_end and fix["t_end"] > g_start:
+                    gap_fixture = fix
+                    break
         segments.append((g_start, g_end, False, gap_fixture))
         cursor = g_end
     if cursor < 0.999:
@@ -690,6 +709,29 @@ def _render_wall_with_door_hole(ax, floor_3d, ceiling_3d, ei, ej, t0, t1, is_fro
         [above], facecolor=clr, edgecolor=EDGE_CLR,
         alpha=alpha, linewidth=lw, zorder=zorder
     ))
+
+
+def _render_wall_above_fixture(ax, floor_3d, ceiling_3d, ei, ej, t0, t1, is_front, fixture_h):
+    """Render wall only above a box fixture (sink, stove, fridge)."""
+    p0_f = floor_3d[ei] + t0 * (floor_3d[ej] - floor_3d[ei])
+    p1_f = floor_3d[ei] + t1 * (floor_3d[ej] - floor_3d[ei])
+    p0_c = ceiling_3d[ei] + t0 * (ceiling_3d[ej] - ceiling_3d[ei])
+    p1_c = ceiling_3d[ei] + t1 * (ceiling_3d[ej] - ceiling_3d[ei])
+
+    clr = WALL_LIGHT if is_front else WALL_DARK
+    alpha = 0.45 if is_front else 1.0
+    lw = 1.0 if is_front else 0.8
+    zorder = 10 if is_front else 1
+
+    # Only render above fixture height
+    if fixture_h < WALL_H - 0.05:
+        p0_top = p0_f.copy(); p0_top[2] = fixture_h
+        p1_top = p1_f.copy(); p1_top[2] = fixture_h
+        above = [p0_top, p1_top, p1_c, p0_c]
+        ax.add_collection3d(Poly3DCollection(
+            [above], facecolor=clr, edgecolor=EDGE_CLR,
+            alpha=alpha, linewidth=lw, zorder=zorder
+        ))
 
 
 # ── main entry ──
@@ -816,18 +858,117 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
                 ftype = fixture["fixture_type"]
                 if ftype == "opening":
                     pass  # no wall at all
-                elif ftype == "window":
-                    _render_wall_with_window_hole(ax, floor_3d, ceiling_3d, i, j, t0, t1, is_front)
                 elif ftype == "door":
                     _render_wall_with_door_hole(ax, floor_3d, ceiling_3d, i, j, t0, t1, is_front)
+                elif ftype == "sink":
+                    _render_wall_above_fixture(ax, floor_3d, ceiling_3d, i, j, t0, t1, is_front, SINK_H)
+                elif ftype == "stove":
+                    _render_wall_above_fixture(ax, floor_3d, ceiling_3d, i, j, t0, t1, is_front, OVEN_H)
+                elif ftype == "fridge":
+                    _render_wall_above_fixture(ax, floor_3d, ceiling_3d, i, j, t0, t1, is_front, FRIDGE_H)
 
-    # top edges + vertical edges
+    # top edges + vertical edges (fixture-aware)
+    # Build a lookup: for each edge, which parametric ranges are gaps?
+    def _get_edge_gaps(edge_idx):
+        """Return list of (t_start, t_end) gaps for an edge."""
+        gaps = []
+        for fix in fixtures:
+            if fix["edge_idx"] != edge_idx:
+                continue
+            ftype = fix["fixture_type"]
+            if ftype == "opening":
+                gaps.append((fix["t_start"], fix["t_end"]))
+            # Door/fixtures don't remove ceiling edge - wall still exists above
+        return gaps
+
+    def _get_full_gaps(edge_idx):
+        """Return all gap ranges where wall is completely removed (openings only)."""
+        gaps = []
+        for fix in fixtures:
+            if fix["edge_idx"] != edge_idx:
+                continue
+            if fix["fixture_type"] == "opening":
+                gaps.append((fix["t_start"], fix["t_end"]))
+        # Sort and merge
+        if not gaps:
+            return []
+        gaps.sort()
+        merged = [list(gaps[0])]
+        for g in gaps[1:]:
+            if g[0] <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], g[1])
+            else:
+                merged.append(list(g))
+        return merged
+
     for i in range(n):
         j = (i + 1) % n
-        ax.plot([ceiling_3d[i,0], ceiling_3d[j,0]], [ceiling_3d[i,1], ceiling_3d[j,1]],
-                [ceiling_3d[i,2], ceiling_3d[j,2]], color=EDGE_CLR, linewidth=1.2, alpha=0.9)
-        ax.plot([floor_3d[i,0], ceiling_3d[i,0]], [floor_3d[i,1], ceiling_3d[i,1]],
-                [floor_3d[i,2], ceiling_3d[i,2]], color=EDGE_CLR, linewidth=1.0, alpha=0.85)
+        full_gaps = _get_full_gaps(i)
+
+        if not full_gaps:
+            # No openings — draw full top edge and both verticals
+            ax.plot([ceiling_3d[i,0], ceiling_3d[j,0]], [ceiling_3d[i,1], ceiling_3d[j,1]],
+                    [ceiling_3d[i,2], ceiling_3d[j,2]], color=EDGE_CLR, linewidth=1.2, alpha=0.9)
+        else:
+            # Draw top edge segments around openings
+            cursor = 0.0
+            for g_start, g_end in full_gaps:
+                if cursor < g_start - 0.001:
+                    p0 = ceiling_3d[i] + cursor * (ceiling_3d[j] - ceiling_3d[i])
+                    p1 = ceiling_3d[i] + g_start * (ceiling_3d[j] - ceiling_3d[i])
+                    ax.plot([p0[0], p1[0]], [p0[1], p1[1]], [p0[2], p1[2]],
+                            color=EDGE_CLR, linewidth=1.2, alpha=0.9)
+                cursor = g_end
+            if cursor < 0.999:
+                p0 = ceiling_3d[i] + cursor * (ceiling_3d[j] - ceiling_3d[i])
+                p1 = ceiling_3d[j]
+                ax.plot([p0[0], p1[0]], [p0[1], p1[1]], [p0[2], p1[2]],
+                        color=EDGE_CLR, linewidth=1.2, alpha=0.9)
+
+        # Vertical edges at corners — only skip if BOTH edges meeting at
+        # this corner are fully open at the junction point
+        # For simplicity: draw vertical if not at an opening boundary
+        prev_edge = (i - 1) % n
+        # Check if this vertex is at the boundary of an opening
+        skip_vert = False
+        for fix in fixtures:
+            if fix["fixture_type"] == "opening":
+                # If this edge starts with an opening at t=0, the vertex i is at a gap boundary
+                if fix["edge_idx"] == i and fix["t_start"] < 0.01:
+                    # Also check if previous edge ends with opening
+                    for fix2 in fixtures:
+                        if fix2["fixture_type"] == "opening" and fix2["edge_idx"] == prev_edge and fix2["t_end"] > 0.99:
+                            skip_vert = True
+                # If previous edge ends with opening at t=1, vertex i is at gap boundary
+                if fix["edge_idx"] == prev_edge and fix["t_end"] > 0.99:
+                    if fix["edge_idx"] == i and fix["t_start"] < 0.01:
+                        skip_vert = True
+
+        if not skip_vert:
+            ax.plot([floor_3d[i,0], ceiling_3d[i,0]], [floor_3d[i,1], ceiling_3d[i,1]],
+                    [floor_3d[i,2], ceiling_3d[i,2]], color=EDGE_CLR, linewidth=1.0, alpha=0.85)
+
+    # Floor edges (also fixture-aware for openings)
+    for i in range(n):
+        j = (i + 1) % n
+        full_gaps = _get_full_gaps(i)
+        if not full_gaps:
+            ax.plot([floor_3d[i,0], floor_3d[j,0]], [floor_3d[i,1], floor_3d[j,1]],
+                    [0.001, 0.001], color=EDGE_CLR, linewidth=0.7, alpha=0.5)
+        else:
+            cursor = 0.0
+            for g_start, g_end in full_gaps:
+                if cursor < g_start - 0.001:
+                    p0 = floor_3d[i] + cursor * (floor_3d[j] - floor_3d[i])
+                    p1 = floor_3d[i] + g_start * (floor_3d[j] - floor_3d[i])
+                    ax.plot([p0[0], p1[0]], [p0[1], p1[1]], [0.001, 0.001],
+                            color=EDGE_CLR, linewidth=0.7, alpha=0.5)
+                cursor = g_end
+            if cursor < 0.999:
+                p0 = floor_3d[i] + cursor * (floor_3d[j] - floor_3d[i])
+                p1 = floor_3d[j]
+                ax.plot([p0[0], p1[0]], [p0[1], p1[1]], [0.001, 0.001],
+                        color=EDGE_CLR, linewidth=0.7, alpha=0.5)
 
     # ── 10. render fixtures (3D objects) ──
     _render_fixtures(ax, fixtures, floor_3d, ceiling_3d, pts_m, scale, cam_dir)
