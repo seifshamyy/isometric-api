@@ -208,7 +208,28 @@ def _detect_colored_segments(img_bgr, pts_px):
             "edge_idx": ei, "t_start": min(t_vals), "t_end": max(t_vals),
             "fixture_type": ft, "width_px": (max(t_vals)-min(t_vals))*_edge_len(pts_px,ei),
         })
-    return segments
+
+    # Merge segments of the same type on the same edge that are close together
+    # (they get split when OCR measurement labels overlap them)
+    merged = []
+    segments.sort(key=lambda s: (s["edge_idx"], s["fixture_type"], s["t_start"]))
+    i = 0
+    while i < len(segments):
+        s = dict(segments[i])  # copy
+        # Look ahead for same edge + same type within a small t-gap
+        while i + 1 < len(segments):
+            nxt = segments[i + 1]
+            if (nxt["edge_idx"] == s["edge_idx"] and
+                nxt["fixture_type"] == s["fixture_type"] and
+                nxt["t_start"] - s["t_end"] < 0.15):  # gap < 15% of edge = likely split by label
+                s["t_end"] = max(s["t_end"], nxt["t_end"])
+                s["width_px"] = (s["t_end"] - s["t_start"]) * _edge_len(pts_px, s["edge_idx"])
+                i += 1
+            else:
+                break
+        merged.append(s)
+        i += 1
+    return merged
 
 def _classify_color(h, s, b, g, r):
     if g > r and g > b and 35 < h < 85 and g-r > 20: return "opening"
