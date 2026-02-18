@@ -1,7 +1,8 @@
 """
 process.py - UNIVERSAL polygon-to-isometric converter
-Unified rendering: walls + fixtures are one integrated geometry pass.
-Painter's algorithm: all faces sorted by camera depth, painted back-to-front.
+Handles: convex, concave, L-shaped, U-shaped, notched, any vertex count.
+Color-coded fixtures: green=opening, pink=sink, magenta=fridge,
+yellow=window, red=oven, blue=door.
 """
 
 import io, re, math
@@ -15,356 +16,250 @@ import pytesseract
 from matplotlib.path import Path as MplPath
 
 # ── rendering constants ──
-WALL_H    = 2.8
-CAM_ELEV  = 48
-CAM_AZIM  = -45
-BG        = "#dde0e5"
-FLOOR_CLR = "#c8c8c8"
-FLOOR_EDGE= "#b8b8b8"
-WALL_LT   = "#909090"
-WALL_DK   = "#7a7a7a"
-EDGE_CLR  = "#555566"
-LABEL_MAX = 180
+WALL_H       = 2.8
+CAM_ELEV     = 48
+CAM_AZIM     = -45
+BG           = "#dde0e5"
+FLOOR_CLR    = "#c8c8c8"
+FLOOR_EDGE   = "#b8b8b8"
+WALL_LIGHT   = "#909090"
+WALL_DARK    = "#7a7a7a"
+EDGE_CLR     = "#555566"
+LABEL_MAX_D  = 180
 
-# ── fixture specs ──
-FIX = {
-    "sink":   {"h": 0.80, "depth": 0.55, "clr": "#FF69B4", "ec": "#CC5590"},
-    "fridge": {"h": 1.80, "depth": 0.65, "clr": "#CC00CC", "ec": "#990099"},
-    "stove":  {"h": 0.85, "depth": 0.55, "clr": "#E03030", "ec": "#AA2020"},
-    "window": {"bot": 0.90, "top": 2.10, "clr": "#FFE44D", "ec": "#CCA800"},
-    "door":   {"h": 2.10, "min_w": 0.70, "clr": "#D2B48C", "ec": "#8a6d4a"},
+# ── fixture standard dimensions (metres) ──
+FIXTURE_DEFS = {
+    "sink":    {"depth": 0.55, "height": 0.85, "color": "#4FC3F7", "edge": "#0288D1", "label": "Sink"},
+    "oven":    {"depth": 0.60, "height": 0.85, "color": "#EF5350", "edge": "#C62828", "label": "Oven"},
+    "fridge":  {"depth": 0.60, "height": 1.80, "color": "#AB47BC", "edge": "#6A1B9A", "label": "Fridge"},
+    "window":  {"depth": 0.05, "h_bot": 0.90, "h_top": 2.10, "color": "#81D4FA", "edge": "#0277BD", "label": "Window"},
+    "door":    {"depth": 0.05, "height": 2.10, "color": "#A1887F", "edge": "#4E342E", "label": "Door"},
+    "opening": None,
 }
 
-# ── color detection ──
-COLOR_RANGES = {
-    "green":   [((35,60,60),(85,255,255))],
-    "pink":    [((160,60,100),(175,255,255))],
-    "magenta": [((145,60,50),(159,255,255))],
-    "yellow":  [((15,60,80),(35,255,255))],
-    "red":     [((0,100,80),(10,255,255)),((170,100,80),(180,255,255))],
-    "blue":    [((90,60,80),(135,255,255))],
-}
-COLOR_MAP = {"green":"opening","pink":"sink","magenta":"fridge",
-             "yellow":"window","red":"stove","blue":"door"}
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# GEOMETRY HELPERS (original, unchanged)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────── geometry helpers ───────────────────────
 
 def _edge_len(pts, i, j=None):
-    if j is None: j = (i+1) % len(pts)
-    return np.hypot(pts[j,0]-pts[i,0], pts[j,1]-pts[i,1])
+    if j is None: j = (i + 1) % len(pts)
+    return np.hypot(pts[j, 0] - pts[i, 0], pts[j, 1] - pts[i, 1])
 
 def _polygon_is_valid(pts):
     n = len(pts)
     if n < 3: return False
-    peri = sum(_edge_len(pts,i) for i in range(n))
-    if peri < 1e-6: return False
-    return all(_edge_len(pts,i) >= peri*0.008 for i in range(n))
+    perimeter = sum(_edge_len(pts, i) for i in range(n))
+    if perimeter < 1e-6: return False
+    min_edge = perimeter * 0.008
+    return all(_edge_len(pts, i) >= min_edge for i in range(n))
 
-def _remove_collinear(pts, thresh=6):
-    out = []
-    n = len(pts)
+def _remove_collinear(pts, angle_thresh_deg=6):
+    out, n = [], len(pts)
     for i in range(n):
-        v1, v2 = pts[(i-1)%n]-pts[i], pts[(i+1)%n]-pts[i]
-        cos_a = np.dot(v1,v2)/(np.linalg.norm(v1)*np.linalg.norm(v2)+1e-12)
-        if abs(math.degrees(math.acos(np.clip(cos_a,-1,1)))-180) > thresh:
-            out.append(pts[i])
+        p0, p1, p2 = pts[(i-1)%n], pts[i], pts[(i+1)%n]
+        v1, v2 = p0 - p1, p2 - p1
+        cos_a = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-12)
+        angle = math.degrees(math.acos(np.clip(cos_a, -1, 1)))
+        if abs(angle - 180) > angle_thresh_deg:
+            out.append(p1)
     return np.array(out) if len(out) >= 3 else pts
+
+def _detect_polygon(contour):
+    perimeter = cv2.arcLength(contour, True)
+    if cv2.contourArea(contour) < 1:
+        return contour.reshape(-1, 2).astype(float)
+    contour_pts = contour.reshape(-1, 2).astype(float)
+    def max_deviation(approx_pts):
+        n_a, max_d = len(approx_pts), 0
+        step = max(1, len(contour_pts) // 200)
+        for cp in contour_pts[::step]:
+            min_d = float('inf')
+            for i in range(n_a):
+                j = (i + 1) % n_a
+                min_d = min(min_d, _perp_dist(cp[0], cp[1], approx_pts[i], approx_pts[j]))
+            max_d = max(max_d, min_d)
+        return max_d
+    candidates = []
+    for eps_mult in np.linspace(0.002, 0.06, 50):
+        approx = cv2.approxPolyDP(contour, eps_mult * perimeter, True)
+        pts = _remove_collinear(approx.reshape(-1, 2).astype(float))
+        if not _polygon_is_valid(pts): continue
+        candidates.append((max_deviation(pts), len(pts), pts))
+    if not candidates:
+        return _remove_collinear(contour.reshape(-1, 2).astype(float), 5)
+    candidates.sort(key=lambda x: x[1])
+    min_dev = min(c[0] for c in candidates)
+    acceptable = sorted([c for c in candidates if c[0] < min_dev * 2.0 + 5.0], key=lambda x: x[1])
+    return acceptable[0][2]
+
+def _signed_area(pts):
+    n = len(pts)
+    return sum(pts[i,0]*pts[(i+1)%n,1] - pts[(i+1)%n,0]*pts[i,1] for i in range(n)) / 2.0
+
+def _ensure_ccw(pts):
+    return pts[::-1].copy() if _signed_area(pts) < 0 else pts.copy()
+
+def _outward_normal_2d(pts, i):
+    j = (i + 1) % len(pts)
+    dx, dy = pts[j,0]-pts[i,0], pts[j,1]-pts[i,1]
+    nx, ny = dy, -dx
+    length = math.hypot(nx, ny)
+    return np.array([nx/length, ny/length]) if length > 1e-12 else np.array([0.0, 0.0])
 
 def _perp_dist(px, py, p0, p1):
     dx, dy = p1[0]-p0[0], p1[1]-p0[1]
-    l2 = dx*dx+dy*dy
-    if l2 < 1e-9: return math.hypot(px-p0[0],py-p0[1])
-    t = max(0,min(1,((px-p0[0])*dx+(py-p0[1])*dy)/l2))
-    return math.hypot(px-(p0[0]+t*dx),py-(p0[1]+t*dy))
+    l2 = dx*dx + dy*dy
+    if l2 < 1e-9: return math.hypot(px-p0[0], py-p0[1])
+    t = max(0, min(1, ((px-p0[0])*dx + (py-p0[1])*dy) / l2))
+    return math.hypot(px - (p0[0]+t*dx), py - (p0[1]+t*dy))
 
-def _detect_polygon(contour):
-    peri = cv2.arcLength(contour, True)
-    if cv2.contourArea(contour) < 1:
-        return contour.reshape(-1,2).astype(float)
-    cpts = contour.reshape(-1,2).astype(float)
-    def maxdev(ap):
-        na = len(ap); step = max(1,len(cpts)//200)
-        return max(min(_perp_dist(cp[0],cp[1],ap[i],ap[(i+1)%na]) for i in range(na)) for cp in cpts[::step])
-    cands = []
-    for em in np.linspace(0.002,0.06,50):
-        pts = _remove_collinear(cv2.approxPolyDP(contour,em*peri,True).reshape(-1,2).astype(float))
-        if _polygon_is_valid(pts): cands.append((maxdev(pts),len(pts),pts))
-    if not cands:
-        return _remove_collinear(cpts, 5)
-    cands.sort(key=lambda x:x[1])
-    md = min(c[0] for c in cands)
-    return sorted([c for c in cands if c[0]<md*2+5],key=lambda x:x[1])[0][2]
+def _point_to_edge_t(px, py, p0, p1):
+    dx, dy = p1[0]-p0[0], p1[1]-p0[1]
+    l2 = dx*dx + dy*dy
+    if l2 < 1e-9: return 0.5
+    return max(0.0, min(1.0, ((px-p0[0])*dx + (py-p0[1])*dy) / l2))
 
-def _signed_area(p):
-    n=len(p); return sum(p[i,0]*p[(i+1)%n,1]-p[(i+1)%n,0]*p[i,1] for i in range(n))/2
+# ─────────────────────── OCR ───────────────────────
 
-def _ensure_ccw(p):
-    return p[::-1].copy() if _signed_area(p)<0 else p.copy()
-
-def _outward_normal(pts, i):
-    j=(i+1)%len(pts); dx,dy=pts[j,0]-pts[i,0],pts[j,1]-pts[i,1]
-    l=math.hypot(dy,-dx)
-    return np.array([dy/l,-dx/l]) if l>1e-12 else np.array([0.,0.])
-
-def _inward_normal(pts, i):
-    return -_outward_normal(pts, i)
-
-# ── OCR ──
-def _ocr_labels(img, w, h):
+def _ocr_labels(img_bgr, w_img, h_img):
     try:
-        sc=3; big=cv2.resize(img,(w*sc,h*sc),interpolation=cv2.INTER_CUBIC)
-        d=pytesseract.image_to_data(big,config="--psm 11",output_type=pytesseract.Output.DICT)
-        toks=[(d["text"][i].strip(),(d["left"][i]+d["width"][i]//2)//sc,(d["top"][i]+d["height"][i]//2)//sc)
-              for i in range(len(d["text"])) if d["text"][i].strip()]
-        labels,skip=[],set()
-        for i,(t,cx,cy) in enumerate(toks):
+        scale = 3
+        big = cv2.resize(img_bgr, (w_img*scale, h_img*scale), interpolation=cv2.INTER_CUBIC)
+        data = pytesseract.image_to_data(big, config="--psm 11", output_type=pytesseract.Output.DICT)
+        tokens = []
+        for i, t in enumerate(data["text"]):
+            t = t.strip()
+            if t:
+                cx = (data["left"][i] + data["width"][i]//2) // scale
+                cy = (data["top"][i] + data["height"][i]//2) // scale
+                tokens.append((t, cx, cy))
+        labels, skip = [], set()
+        for i, (t, cx, cy) in enumerate(tokens):
             if i in skip: continue
-            m=re.match(r"(\d+[.,]\d+)\s*[mM]$",t)
-            if m: labels.append((float(m.group(1).replace(",",".")) ,cx,cy)); continue
-            if re.match(r"\d+[.,]\d+$",t) and i+1<len(toks):
-                nt,nx,ny=toks[i+1]
-                if re.match(r"[mM]$",nt) and abs(nx-cx)<100:
-                    labels.append((float(t.replace(",",".")),(cx+nx)//2,(cy+ny)//2)); skip.add(i+1); continue
-            if re.match(r"\d+[.,]\d+$",t):
-                if i+1<len(toks) and re.match(r"[°]",toks[i+1][0]): continue
-                labels.append((float(t.replace(",",".")),cx,cy))
+            m = re.match(r"(\d+[.,]\d+)\s*[mM]$", t)
+            if m:
+                labels.append((float(m.group(1).replace(",",".")), cx, cy)); continue
+            if re.match(r"\d+[.,]\d+$", t) and i+1 < len(tokens):
+                nt, nx, ny = tokens[i+1]
+                if re.match(r"[mM]$", nt) and abs(nx-cx) < 100:
+                    labels.append((float(t.replace(",",".")), (cx+nx)//2, (cy+ny)//2))
+                    skip.add(i+1); continue
+            if re.match(r"\d+[.,]\d+$", t):
+                if i+1 < len(tokens) and re.match(r"[°]", tokens[i+1][0]): continue
+                labels.append((float(t.replace(",",".")), cx, cy))
         return labels
-    except: return []
+    except Exception:
+        return []
 
 def _assign_labels(pts, labels):
-    n=len(pts); asgn={}; used=set(); trips=[]
-    for li,(v,lx,ly) in enumerate(labels):
+    n = len(pts)
+    assignments, used = {}, set()
+    triples = []
+    for li, (val, lx, ly) in enumerate(labels):
         for ei in range(n):
-            d=_perp_dist(lx,ly,pts[ei],pts[(ei+1)%n])
-            if d<LABEL_MAX: trips.append((d,ei,li))
-    trips.sort()
-    for d,ei,li in trips:
-        if ei in asgn or li in used: continue
-        asgn[ei]=(labels[li][0],f"{labels[li][0]:.2f} m"); used.add(li)
-    return asgn
+            d = _perp_dist(lx, ly, pts[ei], pts[(ei+1)%n])
+            if d < LABEL_MAX_D: triples.append((d, ei, li))
+    triples.sort()
+    for d, ei, li in triples:
+        if ei in assignments or li in used: continue
+        val = labels[li][0]
+        assignments[ei] = (val, f"{val:.2f} m")
+        used.add(li)
+    return assignments
 
-# ── Color detection ──
-def _detect_colors(img, pts):
-    h,w=img.shape[:2]; hsv=cv2.cvtColor(img,cv2.COLOR_BGR2HSV); n=len(pts); out=[]
-    kern=cv2.getStructuringElement(cv2.MORPH_RECT,(3,3))
-    for cn,ranges in COLOR_RANGES.items():
-        mask=np.zeros((h,w),np.uint8)
-        for lo,hi in ranges: mask|=cv2.inRange(hsv,np.array(lo,np.uint8),np.array(hi,np.uint8))
-        mask=cv2.morphologyEx(cv2.morphologyEx(mask,cv2.MORPH_CLOSE,kern,iterations=2),cv2.MORPH_OPEN,kern,iterations=1)
-        cxy=np.argwhere(mask>0)[:,::-1].astype(float)
-        if len(cxy)<10: continue
+# ─────────────────────── COLOR DETECTION ───────────────────────
+
+def _detect_colored_segments(img_bgr, pts_px):
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    n = len(pts_px)
+    sat_mask = hsv[:,:,1] > 55
+    val_mask = hsv[:,:,2] > 75
+    color_mask = (sat_mask & val_mask).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+    color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel)
+    num_labels, labels_map, stats, centroids = cv2.connectedComponentsWithStats(color_mask, 8)
+
+    segments = []
+    for comp_id in range(1, num_labels):
+        area = stats[comp_id, cv2.CC_STAT_AREA]
+        if area < 80: continue
+        comp_mask = (labels_map == comp_id)
+        pb = img_bgr[comp_mask]
+        ph = hsv[comp_mask]
+        mean_b, mean_g, mean_r = pb.mean(axis=0).astype(float)
+        mean_h, mean_s = ph[:,0].mean(), ph[:,1].mean()
+
+        ft = _classify_color(mean_h, mean_s, mean_b, mean_g, mean_r)
+        if ft is None: continue
+
+        ys, xs = np.where(comp_mask)
+        comp_points = np.column_stack([xs, ys]).astype(float)
+
+        best_edge, best_dist = -1, float('inf')
         for ei in range(n):
-            ej=(ei+1)%n; ev=pts[ej]-pts[ei]; el=np.linalg.norm(ev)
-            if el<5: continue
-            ed=ev/el; vecs=cxy-pts[ei]; tv=vecs@ed
-            perp=np.abs(vecs[:,0]*(-ed[1])+vecs[:,1]*ed[0])
-            ok=(tv>=-5)&(tv<=el+5)&(perp<20); tvv=tv[ok]
-            if len(tvv)<5: continue
-            ts=max(0,np.percentile(tvv,2))/el; te=min(el,np.percentile(tvv,98))/el
-            if te-ts<0.02: continue
-            out.append({"edge_idx":ei,"fixture_type":COLOR_MAP[cn],"t_start":ts,"t_end":te,"color_name":cn})
-    return out
+            ej = (ei+1) % n
+            step = max(1, len(comp_points)//50)
+            med = np.median([_perp_dist(p[0],p[1],pts_px[ei],pts_px[ej]) for p in comp_points[::step]])
+            if med < best_dist: best_dist, best_edge = med, ei
+        if best_edge < 0 or best_dist > 30: continue
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# UNIFIED FACE-BASED RENDERER
-# ═══════════════════════════════════════════════════════════════════════════════
+        ei, ej = best_edge, (best_edge+1) % n
+        step = max(1, len(comp_points)//100)
+        t_vals = [_point_to_edge_t(p[0],p[1],pts_px[ei],pts_px[ej]) for p in comp_points[::step]]
+        segments.append({
+            "edge_idx": ei, "t_start": min(t_vals), "t_end": max(t_vals),
+            "fixture_type": ft, "width_px": (max(t_vals)-min(t_vals))*_edge_len(pts_px,ei),
+        })
+    return segments
 
-def _pt(floor, ceil, ei, ej, t, z):
-    """Interpolate a 3D point along edge ei→ej at parametric t, with explicit z."""
-    p = floor[ei] + t * (floor[ej] - floor[ei])
-    p = p.copy(); p[2] = z
-    return p
+def _classify_color(h, s, b, g, r):
+    if g > r and g > b and 35 < h < 85 and g-r > 20: return "opening"
+    if b > r and b > g and 85 < h < 130: return "door"
+    if r > b and g > b and (g-b) > 30 and 10 < h < 40: return "window"
+    if r > 170 and r-g > 60 and r-b > 60 and abs(g-b) < 40: return "oven"
+    if r > g and r > b and b > g and h > 155 and (r-b) > 20: return "sink"
+    if r > g and b > g and abs(r-b) < 30 and 130 < h < 165: return "fridge"
+    if r > b and r > g and b > g and h > 150 and s > 50: return "sink"
+    if r > g and b > g and abs(r-b) < 50 and (r+b)/2 - g > 30: return "fridge"
+    if r > g and r > b and r - max(g,b) > 50: return "oven"
+    return None
 
-def _quad(a,b,c,d):
-    return [np.array(x,dtype=float) for x in [a,b,c,d]]
+# ─────────────────────── depth-sorted face renderer ───────────────────────
 
-def _face_depth(verts, cam_dir):
-    c = np.mean([np.array(v) for v in verts], axis=0)
-    return -np.dot(c, cam_dir)
-
-def _build_scene(n, floor, ceil, pts_m, fixtures, cam_dir):
+def _render_all_faces(ax, faces, cam_dir):
     """
-    Build every renderable face + line + label for the entire scene.
-    Returns: (faces, lines, labels)
-    where faces = [(verts, fc, ec, alpha, lw), ...]
-          lines = [(p0, p1, color, lw, alpha), ...]
-          labels = [(x,y,z, text, fontsize, bbox_fc, bbox_ec), ...]
+    Render all faces using a SINGLE Poly3DCollection with faces pre-sorted
+    back-to-front. This prevents matplotlib from re-sorting them incorrectly.
+    Each face: (verts_list, facecolor, edgecolor, alpha, linewidth)
     """
-    faces = []   # (verts_list, facecolor, edgecolor, alpha, linewidth)
-    lines = []
-    labels = []
+    # Compute depth for each face
+    decorated = []
+    for i, (verts, fc, ec, alpha, lw) in enumerate(faces):
+        center = np.mean(verts, axis=0)
+        depth = -np.dot(center, cam_dir)
+        decorated.append((depth, i, verts, fc, ec, alpha, lw))
+    # Sort back-to-front (farthest first)
+    decorated.sort(key=lambda x: x[0], reverse=True)
+    
+    # Add each face as its own collection (one face per collection = no internal re-sort)
+    # But set _sort_zpos to control matplotlib's inter-collection sorting
+    for idx, (depth, _, verts, fc, ec, alpha, lw) in enumerate(decorated):
+        pc = Poly3DCollection([verts], facecolor=fc, edgecolor=ec, alpha=alpha, linewidth=lw)
+        pc._sort_zpos = -depth  # matplotlib uses _sort_zpos for sorting collections
+        ax.add_collection3d(pc)
 
-    def add_face(v, fc, ec, a=1.0, lw=0.7):
-        faces.append((v, fc, ec, a, lw))
+# ─────────────────────── wall quad helper ───────────────────────
 
-    # ── Floor ──
-    add_face(floor.tolist(), FLOOR_CLR, FLOOR_EDGE, 1.0, 0.8)
+def _make_wall_quad(floor_3d, ceiling_3d, edge_i, t_start, t_end, z_bot, z_top):
+    n = len(floor_3d)
+    j = (edge_i + 1) % n
+    p0 = floor_3d[edge_i] * (1-t_start) + floor_3d[j] * t_start
+    p1 = floor_3d[edge_i] * (1-t_end)   + floor_3d[j] * t_end
+    q0 = p0.copy(); q0[2] = z_bot
+    q1 = p1.copy(); q1[2] = z_bot
+    q2 = p1.copy(); q2[2] = z_top
+    q3 = p0.copy(); q3[2] = z_top
+    return [q0, q1, q2, q3]
 
-    # ── Per-edge: walls + fixtures ──
-    for i in range(n):
-        j = (i+1) % n
-        out2 = _outward_normal(pts_m, i)
-        out3 = np.array([out2[0], out2[1], 0.0])
-        in3 = -out3
-        dot = np.dot(out3, cam_dir)
-        is_front = dot > 0
-        wc = WALL_LT if is_front else WALL_DK
-        wa = 0.45 if is_front else 1.0
-
-        efx = sorted([f for f in fixtures if f["edge_idx"]==i], key=lambda f:f["t_start"])
-        edge_len_m = np.linalg.norm(floor[j][:2] - floor[i][:2])
-
-        cursor = 0.0
-        for fx in efx:
-            ts, te = fx["t_start"], fx["t_end"]
-            ft = fx["fixture_type"]
-
-            # ── solid wall before fixture ──
-            if cursor < ts - 0.001:
-                add_face(_quad(_pt(floor,ceil,i,j,cursor,0), _pt(floor,ceil,i,j,ts,0),
-                               _pt(floor,ceil,i,j,ts,WALL_H), _pt(floor,ceil,i,j,cursor,WALL_H)),
-                         wc, EDGE_CLR, wa)
-
-            # ── fixture zone ──
-            if ft == "opening":
-                pass  # total gap
-
-            elif ft == "door":
-                fi = FIX["door"]; dh = fi["h"]
-                # enforce min width
-                mid = (ts+te)/2; seg_m = (te-ts)*edge_len_m
-                if seg_m < fi["min_w"] and edge_len_m > 0:
-                    ht = (fi["min_w"]/edge_len_m)/2
-                    dts, dte = max(0,mid-ht), min(1,mid+ht)
-                else:
-                    dts, dte = ts, te
-
-                # wall above door
-                add_face(_quad(_pt(floor,ceil,i,j,dts,dh), _pt(floor,ceil,i,j,dte,dh),
-                               _pt(floor,ceil,i,j,dte,WALL_H), _pt(floor,ceil,i,j,dts,WALL_H)),
-                         wc, EDGE_CLR, wa)
-                # door panel
-                off = in3 * 0.04
-                add_face(_quad(_pt(floor,ceil,i,j,dts,0)+off, _pt(floor,ceil,i,j,dte,0)+off,
-                               _pt(floor,ceil,i,j,dte,dh)+off, _pt(floor,ceil,i,j,dts,dh)+off),
-                         fi["clr"], fi["ec"], 0.6 if is_front else 0.8, 1.2)
-                # frame lines
-                for a,b in [(_pt(floor,ceil,i,j,dts,0)+off, _pt(floor,ceil,i,j,dts,dh)+off),
-                            (_pt(floor,ceil,i,j,dte,0)+off, _pt(floor,ceil,i,j,dte,dh)+off),
-                            (_pt(floor,ceil,i,j,dts,dh)+off, _pt(floor,ceil,i,j,dte,dh)+off)]:
-                    lines.append((a,b,fi["ec"],1.5,0.85))
-                # swing arc
-                p0_2d = _pt(floor,ceil,i,j,dts,0)[:2]
-                p1_2d = _pt(floor,ceil,i,j,dte,0)[:2]
-                dw = np.linalg.norm(p1_2d-p0_2d)
-                dd = (p1_2d-p0_2d)/(dw+1e-12); sw = in3[:2]
-                arc = [np.append(p0_2d + dw*(math.cos(k/20*math.pi/2)*dd + math.sin(k/20*math.pi/2)*sw), 0.005) for k in range(21)]
-                for k in range(20): lines.append((arc[k],arc[k+1],fi["ec"],0.8,0.4))
-                # label
-                lp = (_pt(floor,ceil,i,j,dts,dh)+_pt(floor,ceil,i,j,dte,dh))/2
-                labels.append((lp[0],lp[1],lp[2]+0.12,"Door",6.5,fi["clr"],fi["ec"]))
-
-            elif ft == "window":
-                fi = FIX["window"]; wb,wt = fi["bot"],fi["top"]
-                # wall below sill
-                add_face(_quad(_pt(floor,ceil,i,j,ts,0), _pt(floor,ceil,i,j,te,0),
-                               _pt(floor,ceil,i,j,te,wb), _pt(floor,ceil,i,j,ts,wb)),
-                         wc, EDGE_CLR, wa)
-                # wall above lintel
-                add_face(_quad(_pt(floor,ceil,i,j,ts,wt), _pt(floor,ceil,i,j,te,wt),
-                               _pt(floor,ceil,i,j,te,WALL_H), _pt(floor,ceil,i,j,ts,WALL_H)),
-                         wc, EDGE_CLR, wa)
-                # glass (slightly outward)
-                off = out3 * 0.015
-                add_face(_quad(_pt(floor,ceil,i,j,ts,wb)+off, _pt(floor,ceil,i,j,te,wb)+off,
-                               _pt(floor,ceil,i,j,te,wt)+off, _pt(floor,ceil,i,j,ts,wt)+off),
-                         fi["clr"], fi["ec"], 0.55 if is_front else 0.7, 1.0)
-                # crossbars + frame
-                mh=(wb+wt)/2; mt=(ts+te)/2
-                lines.append((_pt(floor,ceil,i,j,ts,mh)+off, _pt(floor,ceil,i,j,te,mh)+off, fi["ec"],1.0,0.7))
-                lines.append((_pt(floor,ceil,i,j,mt,wb)+off, _pt(floor,ceil,i,j,mt,wt)+off, fi["ec"],1.0,0.7))
-                for a,b in [(_pt(floor,ceil,i,j,ts,wb)+off,_pt(floor,ceil,i,j,te,wb)+off),
-                            (_pt(floor,ceil,i,j,te,wb)+off,_pt(floor,ceil,i,j,te,wt)+off),
-                            (_pt(floor,ceil,i,j,te,wt)+off,_pt(floor,ceil,i,j,ts,wt)+off),
-                            (_pt(floor,ceil,i,j,ts,wt)+off,_pt(floor,ceil,i,j,ts,wb)+off)]:
-                    lines.append((a,b,fi["ec"],1.5,0.9))
-                lp=(_pt(floor,ceil,i,j,ts,wt)+_pt(floor,ceil,i,j,te,wt))/2
-                labels.append((lp[0],lp[1],lp[2]+0.12,"Window",6.5,"#FFF8B0",fi["ec"]))
-
-            elif ft in ("sink","stove","fridge"):
-                fi = FIX[ft]; fh=fi["h"]; fd=fi["depth"]
-
-                if is_front:
-                    # Front wall: full wall behind, fixture paints on top
-                    add_face(_quad(_pt(floor,ceil,i,j,ts,0), _pt(floor,ceil,i,j,te,0),
-                                   _pt(floor,ceil,i,j,te,WALL_H), _pt(floor,ceil,i,j,ts,WALL_H)),
-                             wc, EDGE_CLR, wa)
-                else:
-                    # Back wall: only wall ABOVE fixture height (shorter quad won't occlude fixture)
-                    if fh < WALL_H - 0.05:
-                        add_face(_quad(_pt(floor,ceil,i,j,ts,fh), _pt(floor,ceil,i,j,te,fh),
-                                       _pt(floor,ceil,i,j,te,WALL_H), _pt(floor,ceil,i,j,ts,WALL_H)),
-                                 wc, wc, wa, 0.3)  # use wc as edge color to hide seam
-
-                # Box extrudes inward (into the room)
-                ps=_pt(floor,ceil,i,j,ts,0); pe=_pt(floor,ceil,i,j,te,0)
-                ps[2]=0; pe[2]=0
-                depth_vec = in3 * fd
-                c0=ps.copy(); c1=pe.copy()
-                c2=pe+depth_vec; c3=ps+depth_vec
-                c4=c0.copy();c4[2]=fh; c5=c1.copy();c5[2]=fh
-                c6=c2.copy();c6[2]=fh; c7=c3.copy();c7[2]=fh
-                add_face(_quad(c0,c1,c5,c4), fi["clr"],fi["ec"],0.92,0.9)
-                add_face(_quad(c3,c2,c6,c7), fi["clr"],fi["ec"],0.92,0.9)
-                add_face(_quad(c0,c3,c7,c4), fi["clr"],fi["ec"],0.92,0.9)
-                add_face(_quad(c1,c2,c6,c5), fi["clr"],fi["ec"],0.92,0.9)
-                add_face(_quad(c4,c5,c6,c7), fi["clr"],fi["ec"],0.92,0.9)
-                add_face(_quad(c0,c1,c2,c3), fi["clr"],fi["ec"],0.92,0.9)
-                ct=(c4+c5+c6+c7)/4
-                labels.append((ct[0],ct[1],ct[2]+0.08,ft.capitalize(),6.5,"white","#999"))
-
-            cursor = te
-
-        # solid wall after last fixture
-        if cursor < 0.999:
-            add_face(_quad(_pt(floor,ceil,i,j,cursor,0), _pt(floor,ceil,i,j,1,0),
-                           _pt(floor,ceil,i,j,1,WALL_H), _pt(floor,ceil,i,j,cursor,WALL_H)),
-                     wc, EDGE_CLR, wa)
-
-        # ── structural lines for this edge ──
-        openings = [(f["t_start"],f["t_end"]) for f in efx if f["fixture_type"]=="opening"]
-        for z_line, lw_line, a_line in [(WALL_H, 1.2, 0.9), (0.001, 0.7, 0.5)]:
-            cur = 0.0
-            for os,oe in sorted(openings):
-                if cur < os-0.001:
-                    lines.append((_pt(floor,ceil,i,j,cur,z_line),_pt(floor,ceil,i,j,os,z_line),EDGE_CLR,lw_line,a_line))
-                cur = oe
-            if cur < 0.999:
-                lines.append((_pt(floor,ceil,i,j,cur,z_line),_pt(floor,ceil,i,j,1,z_line),EDGE_CLR,lw_line,a_line))
-
-    # ── vertical corner edges ──
-    for i in range(n):
-        prev = (i-1) % n
-        skip = False
-        for f in fixtures:
-            if f["fixture_type"]!="opening": continue
-            if f["edge_idx"]==i and f["t_start"]<0.01:
-                if any(f2["fixture_type"]=="opening" and f2["edge_idx"]==prev and f2["t_end"]>0.99 for f2 in fixtures):
-                    skip=True
-            if f["edge_idx"]==prev and f["t_end"]>0.99:
-                if any(f2["fixture_type"]=="opening" and f2["edge_idx"]==i and f2["t_start"]<0.01 for f2 in fixtures):
-                    skip=True
-        if not skip:
-            lines.append((floor[i].copy(), ceil[i].copy(), EDGE_CLR, 1.0, 0.85))
-
-    return faces, lines, labels
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────── MAIN ───────────────────────
 
 def generate_isometric(img_bgr: np.ndarray) -> bytes:
     h_img, w_img = img_bgr.shape[:2]
@@ -372,104 +267,311 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
     # 1. contour
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5,5), 0)
-    thresh = cv2.adaptiveThreshold(blur,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV,15,4)
-    kern = cv2.getStructuringElement(cv2.MORPH_RECT,(3,3))
-    dilated = cv2.dilate(thresh, kern, iterations=2)
-    cnts,_ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts: raise ValueError("No contours")
-    cnt = max(cnts, key=cv2.contourArea)
+    thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 4)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+    dilated = cv2.dilate(thresh, kernel, iterations=2)
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours: raise ValueError("No contours found")
+    cnt = max(contours, key=cv2.contourArea)
 
     # 2. polygon
     pts_px = _ensure_ccw(_detect_polygon(cnt))
     n = len(pts_px)
 
     # 3. OCR
-    ocr = _ocr_labels(img_bgr, w_img, h_img)
-    meas = _assign_labels(pts_px, ocr)
+    labels_ocr = _ocr_labels(img_bgr, w_img, h_img)
+    wall_meas = _assign_labels(pts_px, labels_ocr)
 
-    # 4. fixtures
-    fixtures = _detect_colors(img_bgr, pts_px)
-    print(f"[DEBUG] {len(fixtures)} fixtures:")
-    for f in fixtures:
-        print(f"  e{f['edge_idx']}: {f['fixture_type']} t=[{f['t_start']:.3f},{f['t_end']:.3f}]")
+    # 4. colored segments
+    colored_segments = _detect_colored_segments(img_bgr, pts_px)
+    print(f"[DEBUG] Found {len(colored_segments)} colored segments:")
+    for seg in colored_segments:
+        print(f"  edge {seg['edge_idx']}: {seg['fixture_type']} t=[{seg['t_start']:.3f},{seg['t_end']:.3f}]")
 
     # 5. scale
-    epx = [_edge_len(pts_px,i) for i in range(n)]
-    if meas:
-        sc = float(np.median([v/epx[ei] for ei,(v,_) in meas.items() if epx[ei]>0]))
+    edge_px = [_edge_len(pts_px, i) for i in range(n)]
+    if wall_meas:
+        scales = [v/edge_px[ei] for ei,(v,_) in wall_meas.items() if edge_px[ei] > 0]
+        scale = float(np.median(scales)) if scales else 4.0/max(edge_px)
     else:
-        sc = 4.0 / max(epx)
+        scale = 4.0/max(edge_px)
     for i in range(n):
-        if i not in meas: meas[i] = (epx[i]*sc, f"{epx[i]*sc:.2f} m")
+        if i not in wall_meas:
+            m = edge_px[i] * scale
+            wall_meas[i] = (m, f"{m:.2f} m")
 
-    # 6. 3D
-    pm = pts_px * sc
-    pm[:,0] -= pm[:,0].min(); pm[:,1] -= pm[:,1].min()
-    fl = np.column_stack([pm[:,0], pm[:,1], np.zeros(n)])
-    cl = np.column_stack([pm[:,0], pm[:,1], np.full(n, WALL_H)])
+    # 6. 3D points
+    pts_m = pts_px * scale
+    pts_m[:,0] -= pts_m[:,0].min()
+    pts_m[:,1] -= pts_m[:,1].min()
+    floor_3d   = np.column_stack([pts_m[:,0], pts_m[:,1], np.zeros(n)])
+    ceiling_3d = np.column_stack([pts_m[:,0], pts_m[:,1], np.full(n, WALL_H)])
 
-    # 7. camera
-    er, ar = np.radians(CAM_ELEV), np.radians(CAM_AZIM)
-    cam = np.array([np.cos(er)*np.cos(ar), np.cos(er)*np.sin(ar), np.sin(er)])
+    # Build fixture lookup
+    opening_segs = {}
+    fixture_segs = {}
+    for seg in colored_segments:
+        ei = seg["edge_idx"]
+        if seg["fixture_type"] == "opening":
+            opening_segs.setdefault(ei, []).append((seg["t_start"], seg["t_end"]))
+        else:
+            fixture_segs.setdefault(ei, []).append((seg["t_start"], seg["t_end"], seg["fixture_type"]))
 
-    # 8. build scene
-    faces, lines, labels = _build_scene(n, fl, cl, pm, fixtures, cam)
+    # Camera
+    elev_r, azim_r = np.radians(CAM_ELEV), np.radians(CAM_AZIM)
+    cam_dir = np.array([np.cos(elev_r)*np.cos(azim_r), np.cos(elev_r)*np.sin(azim_r), np.sin(elev_r)])
 
-    # 9. sort faces: painter's algorithm
-    faces.sort(key=lambda f: _face_depth(f[0], cam), reverse=True)
+    def lerp_edge(ei, t, arr):
+        j = (ei + 1) % n
+        return arr[ei] * (1 - t) + arr[j] * t
 
-    # 10. render
-    sx, sy = np.ptp(pm[:,0]), np.ptp(pm[:,1])
-    fig = plt.figure(figsize=(13,9), facecolor=BG)
+    def get_wall_gaps(ei):
+        gaps = list(opening_segs.get(ei, []))
+        for ts, te, ft in fixture_segs.get(ei, []):
+            if ft == "door": gaps.append((ts, te))
+        return gaps
+
+    def get_solid_intervals(ei):
+        gaps = get_wall_gaps(ei)
+        if not gaps: return [(0.0, 1.0)]
+        gaps.sort()
+        merged = [gaps[0]]
+        for gs, ge in gaps[1:]:
+            if gs <= merged[-1][1]+0.001: merged[-1] = (merged[-1][0], max(merged[-1][1], ge))
+            else: merged.append((gs, ge))
+        solid, prev = [], 0.0
+        for gs, ge in merged:
+            if gs > prev+0.001: solid.append((prev, gs))
+            prev = ge
+        if prev < 0.999: solid.append((prev, 1.0))
+        return solid
+
+    # ── Collect ALL faces for depth-sorted rendering ──
+    all_faces = []
+    all_lines = []
+    all_texts = []
+
+    # Floor
+    all_faces.append((floor_3d.tolist(), FLOOR_CLR, FLOOR_EDGE, 1.0, 0.8))
+
+    # ── WALLS ──
+    for i in range(n):
+        j = (i + 1) % n
+        normal_2d = _outward_normal_2d(pts_m, i)
+        normal_3d = np.array([normal_2d[0], normal_2d[1], 0.0])
+        dot = np.dot(normal_3d, cam_dir)
+        is_back = dot <= 0
+        clr = WALL_DARK if is_back else WALL_LIGHT
+        alpha = 1.0 if is_back else 0.45
+
+        solid = get_solid_intervals(i)
+        fix_on_edge = [(ts,te,ft) for ts,te,ft in fixture_segs.get(i,[]) if ft != "door"]
+        win_on_edge = [(ts,te) for ts,te,ft in fix_on_edge if ft == "window"]
+        counter_on_edge = [(ts,te,ft) for ts,te,ft in fix_on_edge if ft in ("sink","oven","fridge")]
+
+        for s_start, s_end in solid:
+            sub_regions = []
+            for ws, we in win_on_edge:
+                if ws < s_end and we > s_start:
+                    sub_regions.append((max(ws,s_start), min(we,s_end), "window"))
+            for cs, ce, ct in counter_on_edge:
+                if cs < s_end and ce > s_start:
+                    sub_regions.append((max(cs,s_start), min(ce,s_end), ct))
+            sub_regions.sort()
+
+            if not sub_regions:
+                all_faces.append((_make_wall_quad(floor_3d,ceiling_3d,i,s_start,s_end,0,WALL_H), clr, EDGE_CLR, alpha, 0.8))
+            else:
+                prev_t = s_start
+                for rs, re, rtype in sub_regions:
+                    if rs > prev_t + 0.001:
+                        all_faces.append((_make_wall_quad(floor_3d,ceiling_3d,i,prev_t,rs,0,WALL_H), clr, EDGE_CLR, alpha, 0.8))
+                    if rtype == "window":
+                        fd = FIXTURE_DEFS["window"]
+                        all_faces.append((_make_wall_quad(floor_3d,ceiling_3d,i,rs,re,0,fd["h_bot"]), clr, EDGE_CLR, alpha, 0.8))
+                        all_faces.append((_make_wall_quad(floor_3d,ceiling_3d,i,rs,re,fd["h_top"],WALL_H), clr, EDGE_CLR, alpha, 0.8))
+                    else:
+                        fh = FIXTURE_DEFS.get(rtype,{}).get("height",0.85)
+                        all_faces.append((_make_wall_quad(floor_3d,ceiling_3d,i,rs,re,fh,WALL_H), clr, EDGE_CLR, alpha, 0.8))
+                    prev_t = re
+                if prev_t < s_end - 0.001:
+                    all_faces.append((_make_wall_quad(floor_3d,ceiling_3d,i,prev_t,s_end,0,WALL_H), clr, EDGE_CLR, alpha, 0.8))
+
+        # Top edges
+        for s_start, s_end in solid:
+            c0 = lerp_edge(i, s_start, ceiling_3d)
+            c1 = lerp_edge(i, s_end, ceiling_3d)
+            all_lines.append((c0,c1,EDGE_CLR,1.2,0.9))
+        # Vertical edges
+        gaps = get_wall_gaps(i)
+        if not any(gs < 0.01 for gs,ge in gaps):
+            all_lines.append((floor_3d[i], ceiling_3d[i], EDGE_CLR, 1.0, 0.85))
+        for gs, ge in gaps:
+            if gs > 0.01:
+                all_lines.append((lerp_edge(i,gs,floor_3d), lerp_edge(i,gs,ceiling_3d), EDGE_CLR, 1.0, 0.85))
+            if ge < 0.99:
+                all_lines.append((lerp_edge(i,ge,floor_3d), lerp_edge(i,ge,ceiling_3d), EDGE_CLR, 1.0, 0.85))
+
+    # ── FIXTURES ──
+    for seg in colored_segments:
+        ft = seg["fixture_type"]
+        if ft == "opening": continue
+        ei = seg["edge_idx"]
+        ts, te = seg["t_start"], seg["t_end"]
+        normal_2d = _outward_normal_2d(pts_m, ei)
+        normal_3d = np.array([normal_2d[0], normal_2d[1], 0.0])
+        inward_3d = -normal_3d
+        p0_3d = lerp_edge(ei, ts, floor_3d)
+        p1_3d = lerp_edge(ei, te, floor_3d)
+        seg_w = np.linalg.norm(p1_3d - p0_3d)
+        fdef = FIXTURE_DEFS[ft]
+
+        if ft == "window":
+            h_bot, h_top = fdef["h_bot"], fdef["h_top"]
+            off = inward_3d * 0.02
+            w0 = p0_3d+off; w0 = w0.copy(); w0[2] = h_bot
+            w1 = p1_3d+off; w1 = w1.copy(); w1[2] = h_bot
+            w2 = p1_3d+off; w2 = w2.copy(); w2[2] = h_top
+            w3 = p0_3d+off; w3 = w3.copy(); w3[2] = h_top
+            all_faces.append(([w0,w1,w2,w3], "#B3E5FC", "#0277BD", 0.5, 1.2))
+            for a,b in [(w0,w1),(w1,w2),(w2,w3),(w3,w0)]:
+                all_lines.append((a,b,"#0277BD",1.5,0.9))
+            mid_h = (h_bot+h_top)/2
+            mc = (p0_3d+p1_3d)/2+off
+            m_bot = mc.copy(); m_bot[2] = h_bot
+            m_top = mc.copy(); m_top[2] = h_top
+            all_lines.append((m_bot, m_top, "#0277BD", 1.0, 0.7))
+            mh0 = (p0_3d+off).copy(); mh0[2] = mid_h
+            mh1 = (p1_3d+off).copy(); mh1[2] = mid_h
+            all_lines.append((mh0, mh1, "#0277BD", 1.0, 0.7))
+            lp = (w2+w3)/2 + normal_3d*0.15; lp[2] += 0.1
+            all_texts.append((lp[0],lp[1],lp[2],"Window",
+                dict(fontsize=6.5,fontweight="bold",color="#01579B",ha="center",va="bottom",
+                     bbox=dict(boxstyle="round,pad=0.2",facecolor="#E1F5FE",edgecolor="#0277BD",alpha=0.9,linewidth=0.5))))
+            continue
+
+        if ft == "door":
+            h = fdef["height"]
+            off = inward_3d * 0.03
+            d0 = (p0_3d+off).copy(); d0[2] = 0
+            d1 = (p1_3d+off).copy(); d1[2] = 0
+            d2 = (p1_3d+off).copy(); d2[2] = h
+            d3 = (p0_3d+off).copy(); d3[2] = h
+            all_faces.append(([d0,d1,d2,d3], "#8D6E63", "#4E342E", 0.55, 1.0))
+            for a,b in [(d0,d1),(d1,d2),(d2,d3),(d3,d0)]:
+                all_lines.append((a,b,"#4E342E",1.5,0.9))
+            # Handle
+            handle = d1*0.85 + d0*0.15; handle[2] = 1.0
+            all_lines.append((handle, handle + inward_3d*0.001, "#FFD54F", 3.0, 1.0))
+            lp = (d2+d3)/2 + normal_3d*0.15; lp[2] = h+0.1
+            all_texts.append((lp[0],lp[1],lp[2],"Door",
+                dict(fontsize=6.5,fontweight="bold",color="#3E2723",ha="center",va="bottom",
+                     bbox=dict(boxstyle="round,pad=0.2",facecolor="#EFEBE9",edgecolor="#5D4037",alpha=0.9,linewidth=0.5))))
+            continue
+
+        # Counter fixtures: sink, oven, fridge
+        depth = fdef["depth"]
+        height = fdef["height"]
+        color = fdef["color"]
+        ec = fdef["edge"]
+        label = fdef["label"]
+
+        b0 = p0_3d.copy(); b0[2] = 0
+        b1 = p1_3d.copy(); b1[2] = 0
+        b2 = (p1_3d + inward_3d*depth).copy(); b2[2] = 0
+        b3 = (p0_3d + inward_3d*depth).copy(); b3[2] = 0
+        t0 = b0.copy(); t0[2] = height
+        t1 = b1.copy(); t1[2] = height
+        t2 = b2.copy(); t2[2] = height
+        t3 = b3.copy(); t3[2] = height
+
+        all_faces.append(([t0.copy(),t1.copy(),t2.copy(),t3.copy()], color, ec, 0.92, 0.9))
+        all_faces.append(([b2.copy(),b3.copy(),t3.copy(),t2.copy()], color, ec, 0.90, 0.9))
+        all_faces.append(([b0.copy(),b3.copy(),t3.copy(),t0.copy()], color, ec, 0.82, 0.7))
+        all_faces.append(([b1.copy(),b2.copy(),t2.copy(),t1.copy()], color, ec, 0.82, 0.7))
+        all_faces.append(([b0.copy(),b1.copy(),t1.copy(),t0.copy()], color, ec, 0.40, 0.4))
+
+        for a,b in [(t0,t1),(t1,t2),(t2,t3),(t3,t0)]:
+            all_lines.append((a.copy(),b.copy(),ec,1.0,0.9))
+        for a,b in [(b0,t0),(b1,t1),(b2,t2),(b3,t3)]:
+            all_lines.append((a.copy(),b.copy(),ec,0.7,0.8))
+
+        edge_dir_n = (p1_3d - p0_3d) / (np.linalg.norm(p1_3d - p0_3d) + 1e-9)
+
+        if ft == "sink":
+            s0 = (p0_3d + edge_dir_n*seg_w*0.1 + inward_3d*depth*0.15).copy(); s0[2] = height-0.02
+            s1 = (p1_3d - edge_dir_n*seg_w*0.1 + inward_3d*depth*0.15).copy(); s1[2] = height-0.02
+            s2 = (p1_3d - edge_dir_n*seg_w*0.1 + inward_3d*depth*0.85).copy(); s2[2] = height-0.02
+            s3 = (p0_3d + edge_dir_n*seg_w*0.1 + inward_3d*depth*0.85).copy(); s3[2] = height-0.02
+            all_faces.append(([s0,s1,s2,s3], "#E1F5FE", "#0288D1", 0.85, 0.8))
+        elif ft == "oven":
+            od0 = b3.copy() + edge_dir_n*seg_w*0.1; od0[2] = 0.12
+            od1 = b2.copy() - edge_dir_n*seg_w*0.1; od1[2] = 0.12
+            od2 = b2.copy() - edge_dir_n*seg_w*0.1; od2[2] = height*0.55
+            od3 = b3.copy() + edge_dir_n*seg_w*0.1; od3[2] = height*0.55
+            all_faces.append(([od0,od1,od2,od3], "#FFCDD2", "#C62828", 0.75, 0.8))
+        elif ft == "fridge":
+            split_h = height * 0.6
+            fl0 = b3.copy() + edge_dir_n*seg_w*0.05; fl0[2] = split_h
+            fl1 = b2.copy() - edge_dir_n*seg_w*0.05; fl1[2] = split_h
+            all_lines.append((fl0, fl1, "#4A148C", 1.2, 0.8))
+
+        lp = (t0+t1+t2+t3)/4; lp[2] += 0.12
+        all_texts.append((lp[0],lp[1],lp[2], label,
+            dict(fontsize=6.5,fontweight="bold",color=ec,ha="center",va="bottom",
+                 bbox=dict(boxstyle="round,pad=0.2",facecolor="white",edgecolor=ec,alpha=0.9,linewidth=0.5))))
+
+    # ── Setup figure ──
+    span_x = pts_m[:,0].max() - pts_m[:,0].min()
+    span_y = pts_m[:,1].max() - pts_m[:,1].min()
+    fig = plt.figure(figsize=(13, 9), facecolor=BG)
     ax = fig.add_subplot(111, projection="3d")
-    ax.set_facecolor(BG); ax.grid(False); ax.set_axis_off()
-    for p in [ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane]:
-        p.fill=False; p.set_edgecolor("none")
+    ax.set_facecolor(BG)
+    ax.grid(False); ax.set_axis_off()
+    for pane in [ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane]:
+        pane.fill = False; pane.set_edgecolor("none")
 
-    # floor grid
-    path2d = MplPath(pm)
-    for x in np.arange(0, sx+0.5, 0.5):
-        sg = [(x,y) for y in np.arange(0,sy+0.5,0.05) if path2d.contains_point((x,y))]
-        if len(sg)>=2:
-            ax.plot([sg[0][0],sg[-1][0]],[sg[0][1],sg[-1][1]],[.001,.001],
-                    color=FLOOR_EDGE,linewidth=0.35,alpha=0.45)
-    for y in np.arange(0, sy+0.5, 0.5):
-        sg = [(x,y) for x in np.arange(0,sx+0.5,0.05) if path2d.contains_point((x,y))]
-        if len(sg)>=2:
-            ax.plot([sg[0][0],sg[-1][0]],[sg[0][1],sg[-1][1]],[.001,.001],
-                    color=FLOOR_EDGE,linewidth=0.35,alpha=0.45)
+    # Render depth-sorted faces
+    _render_all_faces(ax, all_faces, cam_dir)
 
-    # paint faces
-    for verts, fc, ec, alpha, lw in faces:
-        ax.add_collection3d(Poly3DCollection(
-            [[np.array(v).tolist() for v in verts]],
-            facecolor=fc, edgecolor=ec, alpha=alpha, linewidth=lw))
+    # Floor grid
+    path_2d = MplPath(pts_m)
+    for x in np.arange(0, span_x+0.5, 0.5):
+        segs = [(x,y) for y in np.arange(0, span_y+0.5, 0.05) if path_2d.contains_point((x,y))]
+        if len(segs) >= 2:
+            ax.plot([segs[0][0],segs[-1][0]], [segs[0][1],segs[-1][1]], [0.001,0.001],
+                    color=FLOOR_EDGE, linewidth=0.35, alpha=0.45)
+    for y in np.arange(0, span_y+0.5, 0.5):
+        segs = [(x,y) for x in np.arange(0, span_x+0.5, 0.05) if path_2d.contains_point((x,y))]
+        if len(segs) >= 2:
+            ax.plot([segs[0][0],segs[-1][0]], [segs[0][1],segs[-1][1]], [0.001,0.001],
+                    color=FLOOR_EDGE, linewidth=0.35, alpha=0.45)
 
-    # paint lines
-    for p0,p1,c,lw,a in lines:
-        ax.plot([p0[0],p1[0]],[p0[1],p1[1]],[p0[2],p1[2]], color=c, linewidth=lw, alpha=a)
+    # Lines
+    for p0, p1, clr, lw, alpha in all_lines:
+        ax.plot([p0[0],p1[0]], [p0[1],p1[1]], [p0[2],p1[2]], color=clr, linewidth=lw, alpha=alpha)
 
-    # measurement labels
-    for i,(_, lbl) in meas.items():
-        j=(i+1)%n; mid=(cl[i]+cl[j])/2; nrm=_outward_normal(pm,i)
-        off=np.array([nrm[0],nrm[1],0])*0.25
-        ax.text(mid[0]+off[0],mid[1]+off[1],mid[2]+0.15, lbl,
-                fontsize=7.5, fontweight="bold", color="#222", ha="center", va="bottom",
-                bbox=dict(boxstyle="round,pad=0.25",facecolor="white",edgecolor="#aaa",alpha=0.95,linewidth=0.6),
+    # Measurement labels
+    for i, (_, lbl) in wall_meas.items():
+        j = (i + 1) % n
+        mid_top = (ceiling_3d[i] + ceiling_3d[j]) / 2.0
+        normal_2d = _outward_normal_2d(pts_m, i)
+        offset = np.array([normal_2d[0], normal_2d[1], 0.0]) * 0.25
+        ax.text(mid_top[0]+offset[0], mid_top[1]+offset[1], mid_top[2]+0.15,
+                lbl, fontsize=7.5, fontweight="bold", color="#222", ha="center", va="bottom",
+                bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="#aaa", alpha=0.95, linewidth=0.6),
                 zorder=50)
 
-    # fixture labels
-    for x,y,z,txt,fs,bfc,bec in labels:
-        ax.text(x,y,z,txt, fontsize=fs, fontweight="bold", color="#111", ha="center", va="bottom",
-                bbox=dict(boxstyle="round,pad=0.2",facecolor=bfc,edgecolor=bec,alpha=0.9,linewidth=0.5),
-                zorder=55)
+    # Fixture labels
+    for x, y, z, text, kwargs in all_texts:
+        ax.text(x, y, z, text, zorder=50, **kwargs)
 
-    # limits
-    pad=0.5
-    ax.set_xlim(pm[:,0].min()-pad, pm[:,0].max()+pad)
-    ax.set_ylim(pm[:,1].min()-pad, pm[:,1].max()+pad)
+    # Axes
+    pad = 0.5
+    ax.set_xlim(pts_m[:,0].min()-pad, pts_m[:,0].max()+pad)
+    ax.set_ylim(pts_m[:,1].min()-pad, pts_m[:,1].max()+pad)
     ax.set_zlim(-0.3, WALL_H+pad)
-    ax.set_box_aspect([max(sx,0.1), max(sy,0.1), WALL_H])
+    ax.set_box_aspect([max(span_x,0.1), max(span_y,0.1), WALL_H])
     ax.view_init(elev=CAM_ELEV, azim=CAM_AZIM)
 
     plt.tight_layout()
@@ -478,3 +580,14 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
     plt.close(fig)
     buf.seek(0)
     return buf.read()
+
+
+if __name__ == "__main__":
+    import sys
+    path = sys.argv[1] if len(sys.argv) > 1 else "test_input.png"
+    img = cv2.imread(path)
+    if img is None: print(f"Cannot read {path}"); sys.exit(1)
+    result = generate_isometric(img)
+    out_path = path.rsplit(".", 1)[0] + "_isometric.png"
+    with open(out_path, "wb") as f: f.write(result)
+    print(f"Saved: {out_path}")
