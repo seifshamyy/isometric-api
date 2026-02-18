@@ -170,58 +170,97 @@ def _assign_labels(pts, labels):
 def _detect_colored_segments(img_bgr, pts_px):
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     n = len(pts_px)
-    sat_mask = hsv[:,:,1] > 55
-    val_mask = hsv[:,:,2] > 75
+    sat_mask = hsv[:,:,1] > 60
+    val_mask = hsv[:,:,2] > 80
     color_mask = (sat_mask & val_mask).astype(np.uint8) * 255
+    color_mask_orig = color_mask.copy()  # undilated for color sampling
+    # Dilate to connect thin colored lines - use directional kernels to avoid
+    # merging separate colored segments that are close but distinct
+    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 1))
+    kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 11))
+    mask_h = cv2.dilate(color_mask, kernel_h, iterations=2)
+    mask_v = cv2.dilate(color_mask, kernel_v, iterations=2)
+    color_mask = cv2.bitwise_or(mask_h, mask_v)
+    # Small close to clean up
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
-    color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel)
+    color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel)
     num_labels, labels_map, stats, centroids = cv2.connectedComponentsWithStats(color_mask, 8)
 
     segments = []
     for comp_id in range(1, num_labels):
         area = stats[comp_id, cv2.CC_STAT_AREA]
-        if area < 80: continue
-        comp_mask = (labels_map == comp_id)
-        pb = img_bgr[comp_mask]
-        ph = hsv[comp_mask]
-        mean_b, mean_g, mean_r = pb.mean(axis=0).astype(float)
-        mean_h, mean_s = ph[:,0].mean(), ph[:,1].mean()
+        if area < 300: continue
+        comp_mask_dilated = (labels_map == comp_id)
+        # Get original colored pixels in this component
+        comp_mask_color = comp_mask_dilated & (color_mask_orig > 0)
+        if comp_mask_color.sum() < 20:
+            continue
 
-        ft = _classify_color(mean_h, mean_s, mean_b, mean_g, mean_r)
-        if ft is None: continue
+        # Per-pixel color classification to handle multi-color blobs
+        ys_c, xs_c = np.where(comp_mask_color)
+        color_groups = {}  # fixture_type -> [(y, x), ...]
+        # Sample pixels (up to 2000 for speed)
+        step = max(1, len(ys_c) // 2000)
+        for idx in range(0, len(ys_c), step):
+            py, px = ys_c[idx], xs_c[idx]
+            h_px = float(hsv[py, px, 0])
+            s_px = float(hsv[py, px, 1])
+            b_px = float(img_bgr[py, px, 0])
+            g_px = float(img_bgr[py, px, 1])
+            r_px = float(img_bgr[py, px, 2])
+            ft_px = _classify_color(h_px, s_px, b_px, g_px, r_px)
+            if ft_px is not None:
+                color_groups.setdefault(ft_px, []).append((px, py))  # (x, y)
 
-        ys, xs = np.where(comp_mask)
-        comp_points = np.column_stack([xs, ys]).astype(float)
+        for ft, coords in color_groups.items():
+            if len(coords) < 10: continue
+            comp_points = np.array(coords, dtype=float)
 
-        best_edge, best_dist = -1, float('inf')
-        for ei in range(n):
-            ej = (ei+1) % n
-            step = max(1, len(comp_points)//50)
-            med = np.median([_perp_dist(p[0],p[1],pts_px[ei],pts_px[ej]) for p in comp_points[::step]])
-            if med < best_dist: best_dist, best_edge = med, ei
-        if best_edge < 0 or best_dist > 30: continue
+            # For each edge, check if this color group overlaps it
+            edge_assignments = []
+            for ei in range(n):
+                ej = (ei+1) % n
+                step = max(1, len(comp_points)//80)
+                dists = [_perp_dist(p[0],p[1],pts_px[ei],pts_px[ej]) for p in comp_points[::step]]
+                close_mask = np.array(dists) < 25
+                if close_mask.sum() < 3: continue
+                close_pts = comp_points[::step][close_mask]
+                t_vals = [_point_to_edge_t(p[0],p[1],pts_px[ei],pts_px[ej]) for p in close_pts]
+                t_s, t_e = min(t_vals), max(t_vals)
+                if t_e - t_s < 0.02: continue
+                edge_assignments.append((ei, t_s, t_e))
 
-        ei, ej = best_edge, (best_edge+1) % n
-        step = max(1, len(comp_points)//100)
-        t_vals = [_point_to_edge_t(p[0],p[1],pts_px[ei],pts_px[ej]) for p in comp_points[::step]]
-        segments.append({
-            "edge_idx": ei, "t_start": min(t_vals), "t_end": max(t_vals),
-            "fixture_type": ft, "width_px": (max(t_vals)-min(t_vals))*_edge_len(pts_px,ei),
-        })
+            if not edge_assignments:
+                best_edge, best_dist = -1, float('inf')
+                for ei in range(n):
+                    ej = (ei+1) % n
+                    step = max(1, len(comp_points)//50)
+                    med = np.median([_perp_dist(p[0],p[1],pts_px[ei],pts_px[ej]) for p in comp_points[::step]])
+                    if med < best_dist: best_dist, best_edge = med, ei
+                if best_edge < 0 or best_dist > 30: continue
+                ei = best_edge
+                ej = (ei+1) % n
+                step = max(1, len(comp_points)//100)
+                t_vals = [_point_to_edge_t(p[0],p[1],pts_px[ei],pts_px[ej]) for p in comp_points[::step]]
+                edge_assignments = [(ei, min(t_vals), max(t_vals))]
+
+            for ei, t_s, t_e in edge_assignments:
+                segments.append({
+                    "edge_idx": ei, "t_start": t_s, "t_end": t_e,
+                    "fixture_type": ft, "width_px": (t_e-t_s)*_edge_len(pts_px,ei),
+                })
 
     # Merge segments of the same type on the same edge that are close together
-    # (they get split when OCR measurement labels overlap them)
     merged = []
     segments.sort(key=lambda s: (s["edge_idx"], s["fixture_type"], s["t_start"]))
     i = 0
     while i < len(segments):
-        s = dict(segments[i])  # copy
-        # Look ahead for same edge + same type within a small t-gap
+        s = dict(segments[i])
         while i + 1 < len(segments):
             nxt = segments[i + 1]
             if (nxt["edge_idx"] == s["edge_idx"] and
                 nxt["fixture_type"] == s["fixture_type"] and
-                nxt["t_start"] - s["t_end"] < 0.15):  # gap < 15% of edge = likely split by label
+                nxt["t_start"] - s["t_end"] < 0.15):
                 s["t_end"] = max(s["t_end"], nxt["t_end"])
                 s["width_px"] = (s["t_end"] - s["t_start"]) * _edge_len(pts_px, s["edge_idx"])
                 i += 1
@@ -229,18 +268,44 @@ def _detect_colored_segments(img_bgr, pts_px):
                 break
         merged.append(s)
         i += 1
-    return merged
+
+    # Deduplicate overlapping segments of DIFFERENT types on the same edge
+    # Keep the one with larger width (more pixel evidence)
+    final = []
+    merged.sort(key=lambda s: (s["edge_idx"], s["t_start"]))
+    for seg in merged:
+        overlap = False
+        for j, existing in enumerate(final):
+            if existing["edge_idx"] != seg["edge_idx"]: continue
+            # Check overlap
+            ov_start = max(existing["t_start"], seg["t_start"])
+            ov_end = min(existing["t_end"], seg["t_end"])
+            if ov_end - ov_start > 0.05:  # significant overlap
+                # Keep the wider one
+                if seg["width_px"] > existing["width_px"]:
+                    final[j] = seg
+                overlap = True
+                break
+        if not overlap:
+            final.append(seg)
+    return final
 
 def _classify_color(h, s, b, g, r):
     if g > r and g > b and 35 < h < 85 and g-r > 20: return "opening"
     if b > r and b > g and 85 < h < 130: return "door"
     if r > b and g > b and (g-b) > 30 and 10 < h < 40: return "window"
-    if r > 170 and r-g > 60 and r-b > 60 and abs(g-b) < 40: return "oven"
-    if r > g and r > b and b > g and h > 155 and (r-b) > 20: return "sink"
+    # Oven (red): R dominant, G and B both low and roughly equal
+    # Check BEFORE pink since dark red pixels can have H near 180
+    if r > 150 and r-g > 50 and r-b > 50 and abs(g-b) < 40: return "oven"
+    if r > g and r > b and r - max(g,b) > 50 and abs(g-b) < 30: return "oven"
+    # Pink/Sink: R highest, B clearly second, G lowest — distinct pink hue
+    if r > g and r > b and b > g and h > 155 and (r-b) > 20 and b > 80: return "sink"
+    # Fridge (magenta): R ≈ B, both >> G
     if r > g and b > g and abs(r-b) < 30 and 130 < h < 165: return "fridge"
-    if r > b and r > g and b > g and h > 150 and s > 50: return "sink"
+    if r > b and r > g and b > g and h > 150 and s > 50 and b > 80: return "sink"
     if r > g and b > g and abs(r-b) < 50 and (r+b)/2 - g > 30: return "fridge"
-    if r > g and r > b and r - max(g,b) > 50: return "oven"
+    # Broader oven fallback
+    if r > g and r > b and r - max(g,b) > 40: return "oven"
     return None
 
 # ─────────────────────── depth-sorted face renderer ───────────────────────
@@ -338,6 +403,13 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
         else:
             fixture_segs.setdefault(ei, []).append((seg["t_start"], seg["t_end"], seg["fixture_type"]))
 
+    # Snap openings that cover >90% of an edge to full 0-1
+    for ei in list(opening_segs.keys()):
+        segs = opening_segs[ei]
+        total_open = sum(te - ts for ts, te in segs)
+        if total_open > 0.88:
+            opening_segs[ei] = [(0.0, 1.0)]
+
     # Camera
     elev_r, azim_r = np.radians(CAM_ELEV), np.radians(CAM_AZIM)
     cam_dir = np.array([np.cos(elev_r)*np.cos(azim_r), np.cos(elev_r)*np.sin(azim_r), np.sin(elev_r)])
@@ -352,6 +424,11 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
             if ft == "door": gaps.append((ts, te))
         return gaps
 
+    def is_fully_open(ei):
+        """Check if this edge is entirely an opening (no wall at all)."""
+        gaps = opening_segs.get(ei, [])
+        return any(ts <= 0.01 and te >= 0.99 for ts, te in gaps)
+
     def get_solid_intervals(ei):
         gaps = get_wall_gaps(ei)
         if not gaps: return [(0.0, 1.0)]
@@ -365,6 +442,8 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
             if gs > prev+0.001: solid.append((prev, gs))
             prev = ge
         if prev < 0.999: solid.append((prev, 1.0))
+        # Filter out tiny stubs (<8% of edge) that create floating geometry
+        solid = [(s, e) for s, e in solid if (e - s) > 0.08]
         return solid
 
     # ── Collect ALL faces for depth-sorted rendering ──
@@ -418,20 +497,37 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
                 if prev_t < s_end - 0.001:
                     all_faces.append((_make_wall_quad(floor_3d,ceiling_3d,i,prev_t,s_end,0,WALL_H), clr, EDGE_CLR, alpha, 0.8))
 
-        # Top edges
+        # Top edges for solid wall segments only
         for s_start, s_end in solid:
             c0 = lerp_edge(i, s_start, ceiling_3d)
             c1 = lerp_edge(i, s_end, ceiling_3d)
             all_lines.append((c0,c1,EDGE_CLR,1.2,0.9))
-        # Vertical edges
-        gaps = get_wall_gaps(i)
-        if not any(gs < 0.01 for gs,ge in gaps):
-            all_lines.append((floor_3d[i], ceiling_3d[i], EDGE_CLR, 1.0, 0.85))
-        for gs, ge in gaps:
-            if gs > 0.01:
-                all_lines.append((lerp_edge(i,gs,floor_3d), lerp_edge(i,gs,ceiling_3d), EDGE_CLR, 1.0, 0.85))
-            if ge < 0.99:
-                all_lines.append((lerp_edge(i,ge,floor_3d), lerp_edge(i,ge,ceiling_3d), EDGE_CLR, 1.0, 0.85))
+
+        # Vertical edges at vertex i (start of this edge)
+        # Only draw if this vertex has wall on at least one adjacent edge
+        prev_edge = (i - 1) % n
+        this_has_wall = len(solid) > 0
+        prev_has_wall = len(get_solid_intervals(prev_edge)) > 0
+
+        if this_has_wall or prev_has_wall:
+            # Check if there's a gap right at the start of this edge
+            gaps = get_wall_gaps(i)
+            if not any(gs < 0.01 for gs, ge in gaps):
+                # Also check previous edge doesn't have a gap at its end
+                prev_gaps = get_wall_gaps(prev_edge)
+                if not any(ge > 0.99 for gs, ge in prev_gaps):
+                    all_lines.append((floor_3d[i], ceiling_3d[i], EDGE_CLR, 1.0, 0.85))
+
+        # Vertical edges at gap boundaries within this edge
+        # Only draw if the gap boundary is a real wall-to-gap transition
+        # (not at the very start/end of a fully-open edge)
+        if not is_fully_open(i):
+            gaps = get_wall_gaps(i)
+            for gs, ge in gaps:
+                if gs > 0.05:  # not at edge start
+                    all_lines.append((lerp_edge(i,gs,floor_3d), lerp_edge(i,gs,ceiling_3d), EDGE_CLR, 1.0, 0.85))
+                if ge < 0.95:  # not at edge end
+                    all_lines.append((lerp_edge(i,ge,floor_3d), lerp_edge(i,ge,ceiling_3d), EDGE_CLR, 1.0, 0.85))
 
     # ── FIXTURES ──
     for seg in colored_segments:
