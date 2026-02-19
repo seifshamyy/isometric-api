@@ -222,7 +222,7 @@ def _detect_colored_segments(img_bgr, pts_px):
                 ej = (ei+1) % n
                 step = max(1, len(comp_points)//80)
                 dists = [_perp_dist(p[0],p[1],pts_px[ei],pts_px[ej]) for p in comp_points[::step]]
-                close_mask = np.array(dists) < 25
+                close_mask = np.array(dists) < 50
                 if close_mask.sum() < 3: continue
                 close_pts = comp_points[::step][close_mask]
                 t_vals = [_point_to_edge_t(p[0],p[1],pts_px[ei],pts_px[ej]) for p in close_pts]
@@ -237,7 +237,7 @@ def _detect_colored_segments(img_bgr, pts_px):
                     step = max(1, len(comp_points)//50)
                     med = np.median([_perp_dist(p[0],p[1],pts_px[ei],pts_px[ej]) for p in comp_points[::step]])
                     if med < best_dist: best_dist, best_edge = med, ei
-                if best_edge < 0 or best_dist > 30: continue
+                if best_edge < 0 or best_dist > 60: continue
                 ei = best_edge
                 ej = (ei+1) % n
                 step = max(1, len(comp_points)//100)
@@ -362,6 +362,8 @@ def generate_isometric(img_bgr: np.ndarray) -> bytes:
 
     # 2. polygon
     pts_px = _ensure_ccw(_detect_polygon(cnt))
+    # Post-filter: remove near-collinear vertices (hand-drawn wobble)
+    pts_px = _remove_collinear(pts_px, angle_thresh_deg=15)
     n = len(pts_px)
 
     # 3. OCR
